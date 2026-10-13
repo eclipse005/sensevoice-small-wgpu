@@ -12,8 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use crate::ctc::{greedy, VOCAB};
 use crate::frontend::Frontend;
 use crate::gemm_f32::{
-    gemm_f32, gemm_f32_bias, gemm_f32_bias_tall, gemm_f32_narrow, gemm_f32_tall, GEMM_BM,
-    GEMM_BM_TALL, GEMM_BN,
+    gemm_f32, gemm_f32_bias, gemm_f32_bias_relu, gemm_f32_bias_tall, gemm_f32_narrow,
+    gemm_f32_narrow_relu, gemm_f32_tall, gemm_f32_tall_relu, GEMM_BM, GEMM_BM_TALL, GEMM_BN,
 };
 use crate::gpu::Gpu;
 use crate::shaders;
@@ -148,6 +148,10 @@ enum Pid {
     GemmNtNarrow,
     GemmBNarrow,
     GemmF32cNarrow,
+    /// The feed-forward `w1` projection with the ReLU in the epilogue.
+    GemmBRelu,
+    GemmBTallRelu,
+    GemmBNarrowRelu,
     Fsmn,
     Split,
     Soft,
@@ -185,6 +189,9 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::GemmNtNarrow => "gemm_nt_narrow",
         Pid::GemmBNarrow => "gemm_b_narrow",
         Pid::GemmF32cNarrow => "gemm_f32c_narrow",
+        Pid::GemmBRelu => "gemm_b_relu",
+        Pid::GemmBTallRelu => "gemm_b_tall_relu",
+        Pid::GemmBNarrowRelu => "gemm_b_narrow_relu",
         Pid::Fsmn => "fsmn",
         Pid::Split => "split",
         Pid::Soft => "soft",
@@ -342,6 +349,9 @@ struct Pipes {
     gemm_nt_narrow: wgpu::ComputePipeline,
     gemm_b_narrow: wgpu::ComputePipeline,
     gemm_f32c_narrow: wgpu::ComputePipeline,
+    gemm_b_relu: wgpu::ComputePipeline,
+    gemm_b_tall_relu: wgpu::ComputePipeline,
+    gemm_b_narrow_relu: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
@@ -1126,26 +1136,30 @@ impl GpuEngine {
                         HIDDEN as u32, HIDDEN as u32, 0, 0, 0, HIDDEN as u32, 1,
                     )?;
                     push_ln(&mut push, &mut ops, Pid::LnF32F16, layer.ln2, HIDDEN as u32, pad_u)?;
+                    // `SVS_FUSE_RELU=0` restores the separate ReLU pass.
+                    let w1_pipe = if tuning::fuse_relu() { Pid::GemmBRelu } else { Pid::GemmB };
                     push_gemm(
-                        &mut push, &mut ops, Pid::GemmB, layer.w1, pad_u, FFN as u32,
+                        &mut push, &mut ops, w1_pipe, layer.w1, pad_u, FFN as u32,
                         HIDDEN as u32, FFN as u32, 0, 0, 0, HIDDEN as u32, 1,
                     )?;
-                    let relu_n = pad_u * FFN as u32;
-                    let relu_slot = push(bytemuck::bytes_of(&ReluCfg {
-                        n: relu_n,
-                        _a: 0,
-                        _b: 0,
-                        _c: 0,
-                    }))?;
-                    // The relu kernel works four elements per lane.
-                    ops.push(Op {
-                        pipe: Pid::Relu,
-                        bg: plan.relu,
-                        slot: relu_slot,
-                        x: (relu_n / 4).div_ceil(256),
-                        y: 1,
-                        z: 1,
-                    });
+                    if !tuning::fuse_relu() {
+                        let relu_n = pad_u * FFN as u32;
+                        let relu_slot = push(bytemuck::bytes_of(&ReluCfg {
+                            n: relu_n,
+                            _a: 0,
+                            _b: 0,
+                            _c: 0,
+                        }))?;
+                        // The relu kernel works four elements per lane.
+                        ops.push(Op {
+                            pipe: Pid::Relu,
+                            bg: plan.relu,
+                            slot: relu_slot,
+                            x: (relu_n / 4).div_ceil(256),
+                            y: 1,
+                            z: 1,
+                        });
+                    }
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmF32c, layer.w2, pad_u, HIDDEN as u32,
                         FFN as u32, HIDDEN as u32, 0, 0, 0, FFN as u32, 1,
@@ -1223,6 +1237,7 @@ fn push_gemm(
                 Pid::Gemm => Pid::GemmTall,
                 Pid::GemmNt => Pid::GemmNtTall,
                 Pid::GemmB => Pid::GemmBTall,
+                Pid::GemmBRelu => Pid::GemmBTallRelu,
                 Pid::GemmF32c => Pid::GemmF32cTall,
                 other => other,
             },
@@ -1235,6 +1250,7 @@ fn push_gemm(
                 Pid::Gemm => Pid::GemmNarrow,
                 Pid::GemmNt => Pid::GemmNtNarrow,
                 Pid::GemmB => Pid::GemmBNarrow,
+                Pid::GemmBRelu => Pid::GemmBNarrowRelu,
                 Pid::GemmF32c => Pid::GemmF32cNarrow,
                 other => other,
             },
@@ -1549,6 +1565,9 @@ impl Pipes {
             gemm_nt_narrow: gpu.pipeline("gemm-nt-narrow", &gemm_f32_narrow(true, false, false), "gemm", &gemm_pl)?,
             gemm_b_narrow: gpu.pipeline("gemm-b-narrow", &gemm_f32_narrow(false, false, true), "gemm", &gemm_b_pl)?,
             gemm_f32c_narrow: gpu.pipeline("gemm-f32c-narrow", &gemm_f32_narrow(false, true, true), "gemm", &gemm_b_pl)?,
+            gemm_b_relu: gpu.pipeline("gemm-b-relu", &gemm_f32_bias_relu(), "gemm", &gemm_b_pl)?,
+            gemm_b_tall_relu: gpu.pipeline("gemm-b-tall-relu", &gemm_f32_tall_relu(), "gemm", &gemm_b_pl)?,
+            gemm_b_narrow_relu: gpu.pipeline("gemm-b-narrow-relu", &gemm_f32_narrow_relu(), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
@@ -1592,6 +1611,9 @@ impl Pipes {
             Pid::GemmNtNarrow => &self.gemm_nt_narrow,
             Pid::GemmBNarrow => &self.gemm_b_narrow,
             Pid::GemmF32cNarrow => &self.gemm_f32c_narrow,
+            Pid::GemmBRelu => &self.gemm_b_relu,
+            Pid::GemmBTallRelu => &self.gemm_b_tall_relu,
+            Pid::GemmBNarrowRelu => &self.gemm_b_narrow_relu,
             Pid::Fsmn => &self.fsmn,
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,

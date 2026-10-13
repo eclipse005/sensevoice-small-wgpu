@@ -68,7 +68,7 @@ pub const GEMM_SMEM: u32 = {
 };
 
 pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, GEMM_TX, GEMM_TY, GEMM_BK)
+    gemm_f32_tiled(transb, beta, bias, GEMM_TX, GEMM_TY, GEMM_BK, false)
 }
 
 /// The small-M tile: same micro-tile, half the rows per workgroup and a deeper
@@ -77,17 +77,25 @@ pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
 /// roles flip (454 vs 484 ms) because the deeper slab costs a block of
 /// occupancy, so the encoder picks per dispatch.
 pub fn gemm_f32_tall(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, GEMM_TX, 8, 16)
+    gemm_f32_tiled(transb, beta, bias, GEMM_TX, 8, 16, false)
 }
 
 /// The narrow tile (BN=64, BK=8): same micro-tile and block size, half the
 /// columns.  Doubles the block count of the n-limited shapes (`N = 512`
 /// projections), which is what the short-clip dispatches starve on.
 pub fn gemm_f32_narrow(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, 8, 16, 8)
+    gemm_f32_tiled(transb, beta, bias, 8, 16, 8, false)
 }
 
-fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, bk: usize) -> String {
+fn gemm_f32_tiled(
+    transb: bool,
+    beta: bool,
+    bias: bool,
+    txn: usize,
+    tyn: usize,
+    bk: usize,
+    relu_out: bool,
+) -> String {
     let bm = tyn * GEMM_TM;
     let bn = txn * GEMM_TN;
     let nthr = txn * tyn;
@@ -253,13 +261,18 @@ fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, 
             } else {
                 String::new()
             };
+            let sv = if relu_out {
+                format!("max(o{i}_{g}, vec4<f32>(0.0))")
+            } else {
+                format!("o{i}_{g}")
+            };
             epilogue.push_str(&format!(
                 "    let col{i}_{g} = n0 + tx * TN + {j0}u;\n\
                  var o{i}_{g} = vec4<f32>(c{i}{j0}, c{i}{j1}, c{i}{j2}, c{i}{j3});\n\
                  {bias_line}\
                  let dst{i}_{g} = cbase + row{i} * gd.ldc + col{i}_{g};\n\
                  if (BETA == 1u) {{ o{i}_{g} = o{i}_{g} + C[dst{i}_{g} / 4u]; }}\n\
-                 C[dst{i}_{g} / 4u] = o{i}_{g};\n",
+                 C[dst{i}_{g} / 4u] = {sv};\n",
                 j1 = j0 + 1,
                 j2 = j0 + 2,
                 j3 = j0 + 3,
@@ -367,4 +380,19 @@ mod dump_tests {
         std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_narrow.wgsl", super::gemm_f32_narrow(false, false, false)).unwrap();
         std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_tall.wgsl", super::gemm_f32_tall(false, false, false)).unwrap();
     }
+}
+
+/// [`gemm_f32_bias`] with the ReLU folded into the epilogue: `max(acc + bias, 0)`
+/// is stored directly, so the feed-forward output needs no separate pass. Same
+/// values as bias-then-relu on every element.
+pub fn gemm_f32_bias_relu() -> String {
+    gemm_f32_tiled(false, false, true, GEMM_TX, GEMM_TY, GEMM_BK, true)
+}
+
+pub fn gemm_f32_tall_relu() -> String {
+    gemm_f32_tiled(false, false, true, GEMM_TX, 8, 16, true)
+}
+
+pub fn gemm_f32_narrow_relu() -> String {
+    gemm_f32_tiled(false, false, true, 8, 16, 8, true)
 }

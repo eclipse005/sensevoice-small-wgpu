@@ -98,6 +98,13 @@ pub fn gemm_cache_mode() -> Option<String> {
     std::env::var("SVS_GEMM_CACHE").ok().filter(|v| !v.is_empty())
 }
 
+/// `SVS_FUSE_RELU=0` falls back to the separate ReLU pass after `w1`
+/// (the epilogue variant computes the same `max(acc + bias, 0)`).
+pub fn fuse_relu() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_FUSE_RELU").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_CPU_PROF=1`: per-phase wall-clock accounting in the CPU encoder.
 pub fn cpu_prof() -> bool {
     env_eq1("SVS_CPU_PROF")
