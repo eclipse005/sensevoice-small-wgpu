@@ -874,3 +874,11 @@ GPU 轨道（2026-10-13 第一轮已完成，见 §5.8）：
 - **多段拼接**（默认开，`SVS_SEG_CONCAT=0` 回退）：各段拼成一条序列（每段自带 4 个 query 行），softmax/FSMN 用逐行段 id 做块对角 mask；单段时 id 全 0，与旧的 `t_valid` 掩码位级相同。**踩坑**：softmax 网格是 head-major（x = 4·pad），最初用 `Ids[row]` 导致 head>0 读错段 id → 第 2 段起泄漏（同音频双段测试掩盖了它），改为 `Ids[row % t_pad]` 后逐行 argmax 与逐段路径 **0 行不一致**（`tools/mini_eval/seg_concat_check.py`，2/3/5 段）。
 - **择优**：拼接的 attention 仍付 O(T²)（有用仅 Σt²），按实测代价模型选择（每段 ~20 ms vs 每浪费对 ~50 ns），段少而长时回退逐段。
 - 结果（官方 fsmn-vad，30 s 切点）：merge=0 时 78.1→**190.6**（180s_en）、106.1→**205.7**（90s_en）；merge=15s 时保持 191.8~206.2。文本 8/8 与 Python 一致；11 个回退开关 × 6 素材 gold 全绿。
+
+### 5.8.15 待办：bounds 版段掩码（消掉单段 ~5% 代价，保持拼接正确）
+- 现状（提交 8021c9e，工作区干净、已验证）：段掩码用**逐元素 `Ids[j]==me_id`**。拼接路径正确（8/8 文本、逐行 0 不一致），但单段长音频 N=5 掉到 198.0/238.5/207.1/205.6/163.6/156.8（30s_zh、90s_ja 跌破 CUDA 线）。
+- 替代表达（未提交，已验证**单段恢复** 201.5/243.3/217.0/215.2/175.5/168.6）：把掩码从"逐元素比较"改为**每行存 `[s,e)` 段边界**，循环 `for (j = s + lane; j < e; j += 256)`、写出 `j>=s && j<e`、FSMN 用 `src>=bs && src<be`；单段时 bounds=[0,valid) 与旧 kernel 逐位相同。
+- **但 bounds 版在拼接路径上文本对不上**（2/8；连段 0 都错，`tools/mini_eval/seg_concat_check.py` 报 27/121）。两个待查疑点：
+  1. softmax 的 `fr = r % n`（n=t_pad）与 bounds 表的配合是否与 ids 版的 `Ids[r % n]` 等价；
+  2. 起止不是 256 倍数时 lane 归属变化（仅影响舍入，不该造成 27 行差异）→ 更像 bounds 表内容/写入时机问题（`encode_frames` 里 `write_at(&acts.seg_bounds, ...)` 与图的相对顺序，可用读回校验）。
+- 修复后需重跑：gold 6/6（GPU/CPU）、`seg_concat_check.py`（0 不一致）、VAD 8 用例文本、N=5 单段、11 开关 × 6 素材回退矩阵。
