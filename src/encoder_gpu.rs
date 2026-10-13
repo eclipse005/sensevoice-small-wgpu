@@ -1214,12 +1214,14 @@ fn push_gemm(
     // Short audio leaves a 128-row tile with a grid too small to fill 15 SMs
     // (at pad = 512 an outp dispatch is 16 blocks).  The tall tile halves the
     // rows per workgroup, doubling the m axis; it is the same arithmetic.
-    // Tile choice by M, measured with paired A/B on this card: short clips
-    // (M <= 512) get the 64x64 tile, which quadruples the block count and
-    // fills the card (15s_en 82-84 ms -> 75-79); longer sequences keep the
+    // Tile choice, measured with paired A/B on this card: a shape that is
+    // short on either axis (M or N <= 512) gets the 64x64 tile, which
+    // quadruples the block count and fills the card (15s_en 82-84 -> 74-79 ms;
+    // the N=512 projections and the N=128 attention output at any length,
+    // 90s_ja 408-411 ms). The shapes that are large on both axes keep the
     // 128x128 tile where per-block efficiency and shared-memory reuse win.
     // `SVS_TILE_SMALL=0` routes everything through the 128x128 tile.
-    let (pipe, bm, bn) = if tuning::tile_small() && m <= 512 {
+    let (pipe, bm, bn) = if tuning::tile_small() && (m <= 512 || n <= 512) {
         (
             match pipe {
                 Pid::Gemm => Pid::GemmTall,
