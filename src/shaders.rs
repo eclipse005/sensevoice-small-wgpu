@@ -271,3 +271,175 @@ fn argmax(@builtin(workgroup_id) wid: vec3<u32>,
 "
     .to_string()
 }
+
+/// GPU frontend stage 1: one workgroup per frame. Applies the same window and
+/// pre-emphasis as `frontend.rs`, runs a 512-point radix-2 FFT in shared
+/// memory (bit-reversed input, natural output, the same negative-exponent
+/// convention as rustfft), and reduces the power spectrum through the mel
+/// filterbank to one log-mel row.
+pub fn fbank() -> String {
+    "struct FbankCfg { n_samples: u32, n_frames: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read> Wave: array<f32>;
+@group(0) @binding(1) var<storage, read> Window: array<f32>;
+@group(0) @binding(2) var<storage, read> Mel: array<f32>;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<uniform> cfg: FbankCfg;
+
+var<workgroup> spec: array<vec2<f32>, 512>;
+var<workgroup> pw: array<f32, 257>;
+var<workgroup> red: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn fbank(@builtin(workgroup_id) wid: vec3<u32>,
+         @builtin(local_invocation_id) lid: vec3<u32>) {
+    let f = wid.x;
+    let start = f * 160u;
+    var part = 0.0;
+    for (var i: u32 = lid.x; i < 400u; i = i + 128u) {
+        part = part + Wave[start + i] * 32768.0;
+    }
+    red[lid.x] = part;
+    workgroupBarrier();
+    for (var off: u32 = 64u; off > 0u; off = off >> 1u) {
+        if (lid.x < off) { red[lid.x] = red[lid.x] + red[lid.x + off]; }
+        workgroupBarrier();
+    }
+    let mean = red[0] / 400.0;
+    for (var i: u32 = lid.x; i < 512u; i = i + 128u) {
+        var re = 0.0;
+        if (i < 400u) {
+            let cur = Wave[start + i] * 32768.0 - mean;
+            if (i == 0u) {
+                re = (cur - 0.97 * cur) * Window[0];
+            } else {
+                re = (cur - 0.97 * (Wave[start + i - 1u] * 32768.0 - mean)) * Window[i];
+            }
+        }
+        spec[i] = vec2<f32>(re, 0.0);
+    }
+    workgroupBarrier();
+    for (var e: u32 = 0u; e < 4u; e = e + 1u) {
+        let i = lid.x + e * 128u;
+        var r = 0u;
+        var v = i;
+        for (var b: u32 = 0u; b < 9u; b = b + 1u) {
+            r = (r << 1u) | (v & 1u);
+            v = v >> 1u;
+        }
+        if (i < r) {
+            let t = spec[i];
+            spec[i] = spec[r];
+            spec[r] = t;
+        }
+    }
+    workgroupBarrier();
+    for (var s: u32 = 1u; s <= 9u; s = s + 1u) {
+        let m = 1u << s;
+        let half = m >> 1u;
+        for (var e: u32 = 0u; e < 2u; e = e + 1u) {
+            let b = lid.x + e * 128u;
+            let grp = b / half;
+            let j = b % half;
+            let i0 = grp * m + j;
+            let i1 = i0 + half;
+            let ang = -6.283185307179586 * f32(j) / f32(m);
+            let w = vec2<f32>(cos(ang), sin(ang));
+            let u = spec[i0];
+            let t = vec2<f32>(w.x * spec[i1].x - w.y * spec[i1].y,
+                              w.x * spec[i1].y + w.y * spec[i1].x);
+            spec[i0] = u + t;
+            spec[i1] = u - t;
+        }
+        workgroupBarrier();
+    }
+    // The power spectrum is computed once into shared memory: every mel bin
+    // needs all 257 bins, so deriving it inside the mel loop would repeat the
+    // same 514 multiplies eighty times.
+    for (var k: u32 = lid.x; k < 257u; k = k + 128u) {
+        let c = spec[k];
+        pw[k] = c.x * c.x + c.y * c.y;
+    }
+    workgroupBarrier();
+    if (lid.x < 80u) {
+        var acc = 0.0;
+        for (var k: u32 = 0u; k < 257u; k = k + 1u) {
+            acc = acc + pw[k] * Mel[lid.x * 257u + k];
+        }
+        Out[f * 80u + lid.x] = log(max(acc, 1.1920929e-7));
+    }
+}
+"
+    .to_string()
+}
+
+/// GPU frontend stage 2: one workgroup per output row. Rows `0..4` are the
+/// query embeddings (language / event / itn), the rest gather their LFR window
+/// out of the fbank rows (`clamp(lr*6 + m - 3)`, which reproduces the CPU's
+/// prefix/suffix padding because both are copies of the boundary frame), apply
+/// CMVN, then add the sinusoidal positions encoding and the `sqrt(512)` scale
+/// in the same order as `frontend.rs`. LFR rows also write their CMVN sum, the
+/// `feat_sum` diagnostic.
+pub fn lfr_features() -> String {
+    "struct LfrCfg { n_fbank: u32, n_lfr: u32, t: u32, lid: u32, itn: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<storage, read> Fbank: array<f32>;
+@group(0) @binding(1) var<storage, read> Embed: array<f32>;
+@group(0) @binding(2) var<storage, read> Shift: array<f32>;
+@group(0) @binding(3) var<storage, read> Scale: array<f32>;
+@group(0) @binding(4) var<storage, read> PosInv: array<f32>;
+@group(0) @binding(5) var<storage, read_write> RowSum: array<f32>;
+@group(0) @binding(6) var<storage, read_write> X: array<f32>;
+@group(0) @binding(7) var<uniform> cfg: LfrCfg;
+
+var<workgroup> red: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let scale = sqrt(512.0);
+    if (row < 4u) {
+        let ids = array<u32, 4>(cfg.lid, 1u, 2u, cfg.itn);
+        let base = ids[row] * 560u;
+        for (var j: u32 = lid.x; j < 560u; j = j + 128u) {
+            var v = Embed[base + j] * scale;
+            let pos = f32(row + 1u);
+            if (j < 280u) {
+                v = v + sin(pos * PosInv[j]);
+            } else {
+                v = v + cos(pos * PosInv[j - 280u]);
+            }
+            X[row * 560u + j] = v;
+        }
+        return;
+    }
+    let lr = row - 4u;
+    var part = 0.0;
+    for (var j: u32 = lid.x; j < 560u; j = j + 128u) {
+        let m = j / 80u;
+        let c = j % 80u;
+        var idx = i32(lr * 6u + m) - 3;
+        if (idx < 0) { idx = 0; }
+        let last = i32(cfg.n_fbank) - 1;
+        if (idx > last) { idx = last; }
+        var v = (Fbank[u32(idx) * 80u + c] + Shift[j]) * Scale[j];
+        part = part + v;
+        v = v * scale;
+        let pos = f32(row + 1u);
+        if (j < 280u) {
+            v = v + sin(pos * PosInv[j]);
+        } else {
+            v = v + cos(pos * PosInv[j - 280u]);
+        }
+        X[row * 560u + j] = v;
+    }
+    red[lid.x] = part;
+    workgroupBarrier();
+    for (var off: u32 = 64u; off > 0u; off = off >> 1u) {
+        if (lid.x < off) { red[lid.x] = red[lid.x] + red[lid.x + off]; }
+        workgroupBarrier();
+    }
+    if (lid.x == 0u) { RowSum[lr] = red[0]; }
+}
+"
+    .to_string()
+}

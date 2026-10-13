@@ -46,6 +46,25 @@ pub struct Prepared {
 }
 
 impl Frontend {
+    /// FFT window (400 samples). Used by the GPU frontend; the CPU path keeps
+    /// its own copy in the same struct.
+    pub fn window(&self) -> &[f32] {
+        &self.window
+    }
+
+    /// `[80, 257]` mel filterbank, row-major, last column zero.
+    pub fn mel(&self) -> &[f32] {
+        &self.mel
+    }
+
+    pub fn cmvn_shift(&self) -> &[f32] {
+        &self.cmvn.shift
+    }
+
+    pub fn cmvn_scale(&self) -> &[f32] {
+        &self.cmvn.scale
+    }
+
     pub fn load(model_dir: &Path) -> Result<Self> {
         let cmvn = load_cmvn(&model_dir.join("am.mvn"))?;
         let mut planner = FftPlanner::<f32>::new();

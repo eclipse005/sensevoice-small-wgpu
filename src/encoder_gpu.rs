@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::{Pod, Zeroable};
 
 use crate::ctc::{greedy, VOCAB};
+use crate::frontend::Frontend;
 use crate::gemm_f32::{gemm_f32, gemm_f32_bias, GEMM_BM, GEMM_BN};
 use crate::gpu::Gpu;
 use crate::shaders;
@@ -170,6 +171,28 @@ fn pid_name(p: Pid) -> &'static str {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FbankCfg {
+    n_samples: u32,
+    n_frames: u32,
+    _a: u32,
+    _b: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LfrCfg {
+    n_fbank: u32,
+    n_lfr: u32,
+    t: u32,
+    lid: u32,
+    itn: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
 struct LayerGpu {
     n1w: wgpu::Buffer,
     n1b: wgpu::Buffer,
@@ -204,6 +227,11 @@ struct Acts {
     fsmn: wgpu::Buffer,
     logits: wgpu::Buffer,
     ids: wgpu::Buffer,
+    // GPU frontend scratch: raw samples, one log-mel row per fbank frame, and
+    // the per-LFR-row CMVN sums (the `feat_sum` diagnostic).
+    wave: wgpu::Buffer,
+    fbank: wgpu::Buffer,
+    row_sums: wgpu::Buffer,
 }
 
 struct LayerItem {
@@ -250,6 +278,8 @@ struct Pipes {
     add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
     arg: wgpu::ComputePipeline,
+    fbank: wgpu::ComputePipeline,
+    lfr: wgpu::ComputePipeline,
     ln_l: wgpu::BindGroupLayout,
     gemm_l: wgpu::BindGroupLayout,
     gemm_b_l: wgpu::BindGroupLayout,
@@ -260,6 +290,8 @@ struct Pipes {
     add_l: wgpu::BindGroupLayout,
     relu_l: wgpu::BindGroupLayout,
     arg_l: wgpu::BindGroupLayout,
+    fbank_l: wgpu::BindGroupLayout,
+    lfr_l: wgpu::BindGroupLayout,
 }
 
 pub struct GpuEngine {
@@ -272,6 +304,17 @@ pub struct GpuEngine {
     tp_b: wgpu::Buffer,
     ctc_w: wgpu::Buffer,
     ctc_b: wgpu::Buffer,
+    // Frontend tables (constant across utterances) and their small uniforms.
+    win_tab: wgpu::Buffer,
+    mel_tab: wgpu::Buffer,
+    embed_tab: wgpu::Buffer,
+    cmvn_shift: wgpu::Buffer,
+    cmvn_scale: wgpu::Buffer,
+    pos_inv: wgpu::Buffer,
+    fbank_cfg: wgpu::Buffer,
+    lfr_cfg: wgpu::Buffer,
+    /// Bind groups for the frontend kernels; rebuilt whenever `Acts` grows.
+    front_bg: Option<(wgpu::BindGroup, wgpu::BindGroup)>,
     uni: wgpu::Buffer,
     slot: u64,
     acts: Option<Acts>,
@@ -280,7 +323,7 @@ pub struct GpuEngine {
 }
 
 impl GpuEngine {
-    pub fn new(gpu: Gpu, weights: &Weights) -> Result<Self> {
+    pub fn new(gpu: Gpu, weights: &Weights, front: &Frontend) -> Result<Self> {
         let slot = (gpu.limits.min_uniform_buffer_offset_alignment as u64).max(256);
         let max_t = max_frames(gpu.limits.max_storage_buffer_binding_size as u64);
         if max_t < TILE as usize {
@@ -299,6 +342,24 @@ impl GpuEngine {
         let tp_b = up_f32(&gpu, &weights.tp_b)?;
         let ctc_w = up_mat(&gpu, &weights.ctc.w, weights.ctc.rows, weights.ctc.cols, CTC_PAD)?;
         let ctc_b = up_bias(&gpu, &weights.ctc.b, CTC_PAD)?;
+        // Frontend tables: the same window/mel/CMVN the CPU path uses, plus
+        // the position-encoding inverse table (`add_posenc`'s `inv`, computed
+        // with the same formula so the kernels stay table-driven).
+        let win_tab = up_f32(&gpu, front.window())?;
+        let mel_tab = up_f32(&gpu, front.mel())?;
+        let embed_tab = up_f32(&gpu, &weights.embed)?;
+        let cmvn_shift = up_f32(&gpu, front.cmvn_shift())?;
+        let cmvn_scale = up_f32(&gpu, front.cmvn_scale())?;
+        let pos_inv = {
+            // `add_posenc` runs over the 560-wide embedding, so its half is
+            // EMBED_DIM/2 = 280 (not HIDDEN/2).
+            let half = crate::weights::EMBED_DIM / 2;
+            let log_inc = 10000f32.ln() / (half as f32 - 1.0);
+            let v: Vec<f32> = (0..half).map(|i| (-log_inc * i as f32).exp()).collect();
+            up_f32(&gpu, &v)?
+        };
+        let fbank_cfg = gpu.uniform("fbank-cfg", 256);
+        let lfr_cfg = gpu.uniform("lfr-cfg", 256);
         let uni = gpu.uniform("uni", SLOTS as u64 * slot);
         gpu.flush()?;
         let mut engine = Self {
@@ -311,6 +372,15 @@ impl GpuEngine {
             tp_b,
             ctc_w,
             ctc_b,
+            win_tab,
+            mel_tab,
+            embed_tab,
+            cmvn_shift,
+            cmvn_scale,
+            pos_inv,
+            fbank_cfg,
+            lfr_cfg,
+            front_bg: None,
             uni,
             slot,
             acts: None,
@@ -321,16 +391,96 @@ impl GpuEngine {
         Ok(engine)
     }
 
-    pub fn encode(&mut self, x: &[f32], t: usize, ban: Option<usize>) -> Result<Vec<i32>> {
-        let pad = self.ensure(t)?;
-        let mut bytes = vec![0u8; pad * 560 * 4];
-        for (i, v) in x.iter().enumerate() {
-            let at = i * 4;
-            bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    /// Run the fbank + LFR frontend kernels for one segment and return
+    /// `feat_sum`. The encoder input lands in the shared 560-wide buffer that
+    /// `encode` reads.
+    pub fn run_frontend(
+        &mut self,
+        samples: &[f32],
+        n_fbank: usize,
+        t: usize,
+        lid: u32,
+        itn: u32,
+    ) -> Result<()> {
+        self.ensure(t)?;
+        let (fbank_bg, lfr_bg) = self.front_bg.as_ref().context("frontend bind groups")?;
+        let acts = self.acts.as_ref().unwrap();
+        if (samples.len() * 4) as u64 > acts.wave.size() {
+            bail!(
+                "frontend 波形缓冲 {} 字节放不下 {} 个采样",
+                acts.wave.size(),
+                samples.len()
+            );
         }
-        let in560 = self.acts.as_ref().unwrap().in560.clone();
+        self.gpu.write_at(&acts.wave, 0, bytemuck::cast_slice(samples));
+        self.gpu.write_at(
+            &self.fbank_cfg,
+            0,
+            bytemuck::bytes_of(&FbankCfg {
+                n_samples: samples.len() as u32,
+                n_frames: n_fbank as u32,
+                _a: 0,
+                _b: 0,
+            }),
+        );
+        self.gpu.write_at(
+            &self.lfr_cfg,
+            0,
+            bytemuck::bytes_of(&LfrCfg {
+                n_fbank: n_fbank as u32,
+                n_lfr: 0, // unused by the kernel; the row count is the grid
+                t: t as u32,
+                lid,
+                itn,
+                _p0: 0,
+                _p1: 0,
+                _p2: 0,
+            }),
+        );
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("frontend"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipes.fbank);
+            pass.set_bind_group(0, fbank_bg, &[]);
+            pass.dispatch_workgroups(n_fbank as u32, 1, 1);
+            pass.set_pipeline(&self.pipes.lfr);
+            pass.set_bind_group(0, lfr_bg, &[]);
+            pass.dispatch_workgroups(t as u32, 1, 1);
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        self.gpu.flush()?;
+        if tuning::trace() {
+            // Diagnostic: the same sum/max/FNV fingerprint `frontend::joint`
+            // prints on the CPU side, so the two stages can be compared.
+            for (label, buf, n) in [
+                ("gpu_fbank", &acts.fbank, n_fbank * 80),
+                ("gpu_x", &acts.in560, t * 560),
+            ] {
+                let raw = self.gpu.readback(buf, (n * 4) as u64)?;
+                let mut sum = 0.0f64;
+                let mut max = 0.0f32;
+                let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                for c in raw.chunks_exact(4) {
+                    let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    sum += f64::from(v);
+                    max = max.max(v.abs());
+                    h ^= u64::from(v.to_bits());
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                eprintln!("trace {label} sum={sum:.9} max={max:.9} n={n} h={h:016x}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the encoder graph on whatever `run_frontend` left in the shared
+    /// input buffer.
+    pub fn encode(&mut self, t: usize, n_lfr: usize, ban: Option<usize>) -> Result<(Vec<i32>, f32)> {
+        let pad = self.ensure(t)?;
         let ids = self.acts.as_ref().unwrap().ids.clone();
-        self.gpu.write_at(&in560, 0, &bytes);
         let (ops, blob) = self.record(pad, t, ban)?;
         if tuning::gpu_dump_ops() {
             Self::dump_ops(&ops, pad, t);
@@ -411,18 +561,28 @@ impl GpuEngine {
         if prof {
             self.dump_prof(&qset.unwrap(), &ops)?;
         }
-        let raw = self.gpu.readback(&ids, (t * 4) as u64)?;
+        // One map serves both readbacks: the token ids and the frontend's
+        // per-row CMVN sums (the `feat_sum` diagnostic).
+        let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
+        let raw = self
+            .gpu
+            .readback_many(&[(&ids, (t * 4) as u64), (&row_sums, (n_lfr * 4) as u64)])?;
+        let (id_bytes, sum_bytes) = raw.split_at(t * 4);
+        let mut feat_sum = 0.0f32;
+        for c in sum_bytes.chunks_exact(4) {
+            feat_sum += f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
         if let Some(err) = pollster::block_on(guard.pop()) {
             bail!("GPU 校验失败: {err}");
         }
         let mut frames = Vec::with_capacity(t);
-        for c in raw.chunks_exact(4) {
+        for c in id_bytes.chunks_exact(4) {
             frames.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
         if tuning::gpu_debug() {
-            self.dump_debug(x, pad, t, ops.len(), &frames)?;
+            self.dump_debug(pad, t, ops.len(), &frames)?;
         }
-        Ok(greedy(&frames))
+        Ok((greedy(&frames), feat_sum))
     }
 }
 
@@ -465,9 +625,43 @@ impl GpuEngine {
         let acts = Acts::new(&self.gpu, alloc)?;
         let plan = build_plan(self, &acts)?;
         self.clear(&acts)?;
+        let front_bg = self.build_front_bgs(&acts);
         self.acts = Some(acts);
         self.plan = Some(plan);
+        self.front_bg = Some(front_bg);
         Ok(())
+    }
+
+    /// The frontend kernels bind `Acts` buffers, so their bind groups follow
+    /// every reallocation.
+    fn build_front_bgs(&self, acts: &Acts) -> (wgpu::BindGroup, wgpu::BindGroup) {
+        let dev = &self.gpu.device;
+        let fbank = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fbank-bg"),
+            layout: &self.pipes.fbank_l,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: acts.wave.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.win_tab.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.mel_tab.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: acts.fbank.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.fbank_cfg.as_entire_binding() },
+            ],
+        });
+        let lfr = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lfr-bg"),
+            layout: &self.pipes.lfr_l,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: acts.fbank.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.embed_tab.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.cmvn_shift.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.cmvn_scale.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.pos_inv.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: acts.row_sums.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: acts.in560.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.lfr_cfg.as_entire_binding() },
+            ],
+        });
+        (fbank, lfr)
     }
 
     fn clear(&self, acts: &Acts) -> Result<()> {
@@ -630,13 +824,8 @@ impl GpuEngine {
     ///
     /// Diagnostic only. It reads (never writes) the buffers `encode` just
     /// filled, so the execution path stays readable and unchanged.
-    fn dump_debug(&self, x: &[f32], pad: usize, t: usize, n_ops: usize, frames: &[i32]) -> Result<()> {
-        let xmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-        eprintln!(
-            "gpu debug x_max={xmax} slot={} ops={} pad={pad} t={t}",
-            self.slot,
-            n_ops
-        );
+    fn dump_debug(&self, pad: usize, t: usize, n_ops: usize, frames: &[i32]) -> Result<()> {
+        eprintln!("gpu debug slot={} ops={} pad={pad} t={t}", self.slot, n_ops);
         let a = self.acts.as_ref().unwrap();
         let hid4 = (pad * HIDDEN * 4) as u64;
         let norm4 = (pad * 560 * 4) as u64;
@@ -904,6 +1093,11 @@ impl Acts {
             fsmn: f32b(alloc, HIDDEN, "fsmn"),
             logits: f32b(alloc, CTC_PAD, "logits"),
             ids: gpu.storage("ids", (alloc * 4) as u64),
+            // `wave` holds the raw segment; n <= n_fbank*160 and n_fbank <=
+            // 6*alloc (the LFR rows plus the four query rows fit in `alloc`).
+            wave: gpu.storage("wave", ((alloc * 960 + 960) * 4) as u64),
+            fbank: gpu.storage("fbank", (alloc * 480 * 4) as u64),
+            row_sums: gpu.storage("row_sums", (alloc * 4) as u64),
         })
     }
 
@@ -1119,6 +1313,12 @@ impl Pipes {
         let add_l = bgl(dev, "add", &[ro(0), ro(1), rw(2), uni(3)]);
         let relu_l = bgl(dev, "relu", &[rw(0), uni(1)]);
         let arg_l = bgl(dev, "arg", &[ro(0), uni(1), rw(2)]);
+        let fbank_l = bgl(dev, "fbank", &[ro(0), ro(1), ro(2), rw(3), uni_s(4)]);
+        let lfr_l = bgl(
+            dev,
+            "lfr",
+            &[ro(0), ro(1), ro(2), ro(3), ro(4), rw(5), rw(6), uni_s(7)],
+        );
         let pl = |l: &wgpu::BindGroupLayout, name: &str| {
             dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(name),
@@ -1136,6 +1336,8 @@ impl Pipes {
         let add_pl = pl(&add_l, "add");
         let relu_pl = pl(&relu_l, "relu");
         let arg_pl = pl(&arg_l, "arg");
+        let fbank_pl = pl(&fbank_l, "fbank");
+        let lfr_pl = pl(&lfr_l, "lfr");
         Ok(Self {
             ln: gpu.pipeline("ln", &shaders::layernorm(), "layernorm", &ln_pl)?,
             gemm: gpu.pipeline("gemm", &gemm_f32(false, false, false), "gemm", &gemm_pl)?,
@@ -1149,6 +1351,8 @@ impl Pipes {
             add: gpu.pipeline("add", &shaders::add(), "add", &add_pl)?,
             relu: gpu.pipeline("relu", &shaders::relu(), "relu", &relu_pl)?,
             arg: gpu.pipeline("arg", &shaders::argmax(), "argmax", &arg_pl)?,
+            fbank: gpu.pipeline("fbank", &shaders::fbank(), "fbank", &fbank_pl)?,
+            lfr: gpu.pipeline("lfr", &shaders::lfr_features(), "lfr_features", &lfr_pl)?,
             ln_l,
             gemm_l,
             gemm_b_l,
@@ -1159,6 +1363,8 @@ impl Pipes {
             add_l,
             relu_l,
             arg_l,
+            fbank_l,
+            lfr_l,
         })
     }
 
@@ -1203,6 +1409,21 @@ fn uni(binding: u32) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: true,
             min_binding_size: NonZeroU64::new(256),
+        },
+        count: None,
+    }
+}
+
+/// A uniform bound whole (no dynamic offset): the frontend kernels have one
+/// config each and no slot table.
+fn uni_s(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
         },
         count: None,
     }

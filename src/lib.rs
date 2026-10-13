@@ -29,7 +29,7 @@ use anyhow::{bail, Result};
 use crate::ctc::EMO_UNK;
 use crate::encoder_cpu::CpuEngine;
 use crate::encoder_gpu::GpuEngine;
-use crate::frontend::{Frontend, WINDOW};
+use crate::frontend::{Frontend, LFR_N, SHIFT, WINDOW};
 use crate::gpu::{DeviceSelector, Gpu};
 use crate::postprocess::{read_tags, rich_post};
 use crate::tokenizer::Tokenizer;
@@ -134,7 +134,7 @@ impl Model {
             let gpu = pollster::block_on(Gpu::new_with(sel))?;
             let device = gpu.describe();
             eprintln!("sensevoice: {device}");
-            let engine = GpuEngine::new(gpu, &weights)?;
+            let engine = GpuEngine::new(gpu, &weights, &front)?;
             drop(weights);
             (Engine::Gpu(engine), device)
         };
@@ -186,18 +186,38 @@ impl Model {
             if audio.len() < WINDOW {
                 continue;
             }
-            let t0 = Instant::now();
-            let prep = self.front.prepare(audio, &self.embed, lid, itn)?;
-            frontend_ms += elapsed_ms(t0);
-            feat_sum += prep.feat_sum;
-            n_lfr += prep.n_lfr;
-            n_input += prep.t;
-            let t1 = Instant::now();
             let ids = match &mut self.engine {
-                Engine::Cpu(cpu) => cpu.encode(&prep.x, prep.t, ban),
-                Engine::Gpu(gpu) => gpu.encode(&prep.x, prep.t, ban)?,
+                Engine::Cpu(cpu) => {
+                    // The CPU frontend stays the alignment oracle for this path.
+                    let t0 = Instant::now();
+                    let prep = self.front.prepare(audio, &self.embed, lid, itn)?;
+                    frontend_ms += elapsed_ms(t0);
+                    feat_sum += prep.feat_sum;
+                    n_lfr += prep.n_lfr;
+                    n_input += prep.t;
+                    let t1 = Instant::now();
+                    let ids = cpu.encode(&prep.x, prep.t, ban);
+                    encode_ms += elapsed_ms(t1);
+                    ids
+                }
+                Engine::Gpu(gpu) => {
+                    // Same features, computed on the GPU: the CPU only uploads
+                    // the samples and reads back the token ids.
+                    let n_fbank = 1 + (audio.len() - WINDOW) / SHIFT;
+                    let lfr_rows = (n_fbank + LFR_N - 1) / LFR_N;
+                    let t = lfr_rows + 4;
+                    let t0 = Instant::now();
+                    gpu.run_frontend(audio, n_fbank, t, lid as u32, itn as u32)?;
+                    frontend_ms += elapsed_ms(t0);
+                    n_lfr += lfr_rows;
+                    n_input += t;
+                    let t1 = Instant::now();
+                    let (ids, fs) = gpu.encode(t, lfr_rows, ban)?;
+                    encode_ms += elapsed_ms(t1);
+                    feat_sum += fs;
+                    ids
+                }
             };
-            encode_ms += elapsed_ms(t1);
             let raw = self.tok.decode(&ids);
             raws.push(raw.clone());
             segments.push(SegmentOut {
