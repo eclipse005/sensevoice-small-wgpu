@@ -129,3 +129,20 @@ $PY eval_compare.py                                    # 一致率 + RTFx + ref 
 | 90s_en merge=15s | 191.4 | 196.9 | **206.2** |
 
 （对照：官方全管线 85/89/57/48/118/101/96/100；Python 仅 ASR 163/142/74/62/247/163/155/146。）
+
+## API 能力对齐盘点（2026-10-13 定稿）
+
+几何口径：**只对齐"不需要外接模型"的能力**（外接模型类能力按用户决定不做）。
+
+| 能力 | 官方 SenseVoice | 本仓 | 状态 |
+|---|---|---|---|
+| ITN 开/关（`use_itn`） | 模型内 prompt 标签（`withitn`/`woitn`） | 同路径（token 14/15） | **对齐**（4 素材 × 开/关，8/8 逐字一致；开=有标点、关=无标点+数字裸写） |
+| 语言 `auto/zh/en/yue/ja/ko/nospeech` | ✓ | ✓（lid 表逐值相同） | 对齐 |
+| `ban_emo_unk` | ✓ | ✓ | 对齐 |
+| VAD 切点 + `merge_vad/merge_length_s` | ✓ | ✓（`--vad-segments`/`Options.segments`、`--merge-ms`） | 对齐（VAD 8 用例 8/8） |
+| model 级 `hotword` | ✗ SenseVoice 不支持 | ✗ | **一致（都不支持）** |
+| 流式 `cache` / chunk | ✗ 模型 `inference` 无 chunk 分支 | ✗ | **一致（都离线整段）** |
+| `postprocess_hotwords` | ✓ 纯文本后处理 | ✗ | **决定不做**（需内嵌拼音表+rapidfuzz 同款相似度） |
+| `punc_model` / `spk_model`（外接模型） | 需外接 | 不做 | 决定不做 |
+
+默认值差异（需注意）：本仓 `Options::default().use_itn = true`（CLI 默认亦开），FunASR `model.inference` 默认 `use_itn=False`；要复现官方默认行为请显式传 `false`。
