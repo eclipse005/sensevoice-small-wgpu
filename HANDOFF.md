@@ -529,19 +529,34 @@ cargo build --release
 | 文件 | 职责 |
 |---|---|
 | `src\gemm_f32.rs` | **GEMM WGSL 代码生成器**（具名标量累加器 + 矩形线程 + 双缓冲）。当前最重要的优化文件 |
-| `src\encoder_gpu.rs` | GPU 引擎。`record()` 生成 984 个 op；分批提交在 `encode()`；新增 `dump_prof()` 剖面 |
-| `src\encoder_cpu.rs` | CPU 编码器（本轮主战场）：`freeze_gemm_tiling()` 确定性修复、FSMN 翻转、CTC 分块、`trace_on` FNV 门禁、`Prof` 分相 |
+| `src\encoder_gpu.rs` | GPU 引擎。`record()` 生成 984 个 op；分批提交在 `encode()`；诊断（`dump_prof`/`dump_ops`/`dump_debug`）已抽成方法 |
+| `src\encoder_cpu.rs` | CPU 编码器：`freeze_gemm_tiling()` 确定性修复、FSMN 翻转、CTC 分块、`trace_on` FNV 门禁、`Prof` 分相 |
+| `src\tuning.rs` | **全部 `SVS_*` 开关的唯一注册处**（11 个变量，含默认值与回退语义文档） |
+| `src\cpu_affinity.rs` | Windows 线程亲和性 + CPUID（`freeze_gemm_tiling` 的 P/E 核选择依赖它） |
 | `src\ctc.rs` | `argmax_tile`（fused bias+argmax，按 vocab 块增量更新 best）+ `greedy` |
 | `src\gpu.rs` | `Gpu::{readback, readback_many, describe}`；共享内存上限检查在 `new_with()` 约 240 行 |
 | `src\shaders.rs` | 非 GEMM 的 WGSL（ln / soft / fsmn / merge / split / add / relu / arg） |
 | `Cargo.toml` | 新增 `gemm-common = "0.18"`（必须与 `gemm` 同版本，共享同一 `CACHE_INFO`） |
 | `README.md` | **含选型实测表、寄存器陷阱、TDR 说明、分块参数结论——但数据仍是双缓冲前的旧值，最终需刷新** |
 
+2026-10-13 结构整理（`16dd0c6`/`c383725`/`8464961`）：删除了 807 行的死模块
+`gemm_shader.rs` 与 `pack.rs`、f16 残骸、三个死 `Pid` 与五条重复 pipeline；
+`U4` 匿名 blob 换成具名配置结构体；`encode()` 里的诊断块抽成方法；
+`SVS_*` 开关集中到 `tuning.rs`；亲和性/CPUID 拆到 `cpu_affinity.rs`。
+现在 `cargo build --release` **零警告**。行为门禁已验：12/12 测试、
+CPU 全迹 78/78 逐字节一致、6/6 gold × CPU/GPU、90s_en 配对 A/B RTFx 在噪声内。
+
 ### 本地 git 仓库
 
 `D:\SenseVoiceSmall\SenseVoiceSmall-wgpu` 已初始化本地 git（无远程），提交历史：
 
 ```
+8464961 结构：SVS_* 开关集中到 tuning.rs，Windows 亲和性拆到 cpu_affinity.rs
+c383725 GPU 结构：具名配置结构体替代 U4、LN 三条 pipeline 合一、诊断块抽出 encode()
+16dd0c6 清理：删除 gemm_shader/pack/f16 残骸与死 Pid，处理全部编译警告（零警告）
+f85f8fc 文档：记录 GPU 剖面实测（GEMM 家族 83.7%）与后续方向
+79fe2ed GPU 剖面：MAP_READ 不能与 QUERY_RESOLVE 同 buffer，改用 resolve+staging 两段式
+525147a 文档：同步 2026-10-13 CPU 闭环状态（确定性修复 + FSMN/CTC 优化）
 a6f068c CTC 投影按 vocab 分块 + bias 折进 argmax：工作集 151MB→12MB
 32cc464 FSMN 循环嵌套翻转：fsmn 分相 15.0→8.4 ms（6/6 配对胜出）
 0be4b36 初始提交：SenseVoiceSmall 推理（Rust CPU + wgpu）

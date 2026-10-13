@@ -659,7 +659,6 @@ unsafe fn gemm_f32(
     }
 }
 
-#[allow(dead_code)]
 fn trace(name: &str, x: &[f32]) {
     if tuning::trace() {
         trace_on(name, x);
@@ -668,7 +667,6 @@ fn trace(name: &str, x: &[f32]) {
 
 /// Per-phase buffers. `SVS_TRACE_FINE=1` — only for bisecting a run-to-run
 /// difference down to the stage that first produces it.
-#[allow(dead_code)]
 fn trace_f(name: &str, x: &[f32]) {
     if tuning::trace_fine() {
         trace_on(name, x);

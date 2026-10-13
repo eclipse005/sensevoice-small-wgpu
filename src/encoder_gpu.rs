@@ -120,8 +120,14 @@ enum Hid {
 
 #[derive(Clone, Copy)]
 enum Pid {
+    /// Layer 0's input norm (`d = 560`).
     Ln,
+    /// Layer-input norm at `d = 512`.
+    ///
+    /// The name is historical: every activation is f32, and all three `Ln*`
+    /// ids resolve to one pipeline and differ only in which buffer they bind.
     LnF32F16,
+    /// Post-encoder norms (`after_norm`, `tp_norm`) at `d = 512`.
     LnF32,
     Gemm,
     GemmNt,

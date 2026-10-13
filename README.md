@@ -4,7 +4,7 @@
 
 VAD 模型不内置。调用方传入毫秒段，或整段转写。官方 `merge_vad` 的游标从 0 开始，会改写精确的段，所以默认不合并。要复现官方 demo 的 15 秒合并，再传 `--merge-ms 15000`。一段超过 GPU 缓冲时直接报错，不会按时间悄悄切开。
 
-CPU f32 是对齐基准。GPU 权重和激活用 f16 存储、f32 累加；6 个 fixtures 上 GPU 与 CPU 的 token id 逐个一致，但短音频偶发分歧时仍以 CPU 为准。
+CPU f32 是对齐基准。GPU 同为 f32 存储与累加，6 个 fixtures 上 GPU 与 CPU 的 token id 逐个一致，但短音频偶发分歧时仍以 CPU 为准。
 
 ## 选 CPU 还是 GPU
 
