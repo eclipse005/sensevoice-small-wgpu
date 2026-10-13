@@ -6,3 +6,11 @@
 90s_ja   median   412.5 ms  RTFx  216.6  target  213.4  OK   gold=False
 180s_en  median  1002.7 ms  RTFx  175.8  target  146.1  OK   gold=False
 180s_zh  median  1064.3 ms  RTFx  169.1  target  145.6  OK   gold=False
+
+# ── 独立复测第 2 轮（同一提交 c9ade40，同协议 bench_median.ps1 -N 5）──
+15s_en   median    73.7 ms  RTFx  203.6  target  193.1  OK   gold=False
+30s_zh   median   122.3 ms  RTFx  246.1  target  239.8  OK   gold=False
+90s_en   median   412.6 ms  RTFx  218.1  target  192.8  OK   gold=False
+90s_ja   median   412.7 ms  RTFx  216.5  target  213.4  OK   gold=False
+180s_en  median  1003.9 ms  RTFx  175.6  target  146.1  OK   gold=False
+180s_zh  median  1064.7 ms  RTFx  169.1  target  145.6  OK   gold=False
