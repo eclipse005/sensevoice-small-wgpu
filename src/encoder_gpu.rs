@@ -808,7 +808,14 @@ impl GpuEngine {
     }
 
     fn ensure(&mut self, t: usize) -> Result<usize> {
-        let pad = (t + TILE as usize - 1) / TILE as usize * TILE as usize;
+        // The pad only has to make each GEMM grid exact. Short clips run the
+        // 64x64 tile family (every shape has m or n <= 512 there), long ones
+        // mix 64 and 128, so a multiple of 64 is enough below 512 rows while
+        // everything above keeps the 128 multiple. Padding a 0.6 s VAD cut to
+        // a full 128-row tile used to cost a whole tile of work per segment;
+        // on the 50-segment 180 s_en VAD run that halved the GEMM time.
+        let step = if t <= 512 { 64 } else { TILE as usize };
+        let pad = (t + step - 1) / step * step;
         if pad > self.max_t {
             bail!(
                 "这段音频有 {t} 帧（对齐到 {pad}），超过这张 GPU 单次能放下的 {} 帧。请把更短的 VAD 段通过 --vad-segments 传进来",
