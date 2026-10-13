@@ -68,6 +68,7 @@ fn mem_trace(tag: &str) {
     }
 }
 
+
 fn run() -> Result<()> {
     let args = Args::parse()?;
     if args.help {
