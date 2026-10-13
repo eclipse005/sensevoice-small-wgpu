@@ -51,13 +51,63 @@ struct SplitCfg {
     p: u32,
 }
 
+// Per-op uniforms. Each one mirrors the WGSL struct of the same name in
+// `shaders.rs`; the field names carry the meaning so a swap cannot go
+// unnoticed. (The old shared `U4 { a, b, c, d }` blob put `t_valid`/`t_pad`
+// in opposite slots for FSMN and merge.)
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct U4 {
-    a: u32,
-    b: u32,
-    c: u32,
-    d: u32,
+struct FsmnCfg {
+    t_valid: u32,
+    t_pad: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SoftCfg {
+    t_valid: u32,
+    t_pad: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MergeCfg {
+    t_pad: u32,
+    t_valid: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct AddCfg {
+    n: u32,
+    mode: u32,
+    _p0: u32,
+    _p1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ReluCfg {
+    n: u32,
+    _a: u32,
+    _b: u32,
+    _c: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ArgCfg {
+    t_valid: u32,
+    n_vocab: u32,
+    stride: u32,
+    ban: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -182,8 +232,6 @@ struct Plan {
 
 struct Pipes {
     ln: wgpu::ComputePipeline,
-    ln_f32_f16: wgpu::ComputePipeline,
-    ln_f32: wgpu::ComputePipeline,
     gemm: wgpu::ComputePipeline,
     gemm_nt: wgpu::ComputePipeline,
     gemm_b: wgpu::ComputePipeline,
@@ -278,18 +326,7 @@ impl GpuEngine {
         self.gpu.write_at(&in560, 0, &bytes);
         let (ops, blob) = self.record(pad, t, ban)?;
         if std::env::var("SVS_GPU_DUMP_OPS").ok().as_deref() == Some("1") {
-            eprintln!("gpu ops total={} pad={pad} t={t}", ops.len());
-            for (i, op) in ops.iter().enumerate() {
-                eprintln!(
-                    "op {i:4} {:<10} bg={:<4} slot={:<4} dispatch=({},{},{})",
-                    pid_name(op.pipe),
-                    op.bg,
-                    op.slot,
-                    op.x,
-                    op.y,
-                    op.z
-                );
-            }
+            Self::dump_ops(&ops, pad, t);
         }
         self.gpu.write_at(&self.uni, 0, &blob);
         let stop = std::env::var("SVS_GPU_STOP")
@@ -383,71 +420,7 @@ impl GpuEngine {
             frames.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
         if std::env::var("SVS_GPU_DEBUG").ok().as_deref() == Some("1") {
-            let xmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-            eprintln!(
-                "gpu debug x_max={xmax} slot={} ops={} pad={pad} t={t}",
-                self.slot,
-                ops.len()
-            );
-            let a = self.acts.as_ref().unwrap();
-            let hid4 = (pad * HIDDEN * 4) as u64;
-            let norm4 = (pad * 560 * 4) as u64;
-            let logits4 = ((t * VOCAB * 4) as u64).min((pad * CTC_PAD * 4) as u64);
-            let ids4 = (t * 4) as u64;
-            let parts: Vec<(&wgpu::Buffer, u64)> = vec![
-                (&a.in560, 64),
-                (&a.h0, hid4),
-                (&a.h1, hid4),
-                (&a.norm, norm4),
-                (&a.ctx, hid4),
-                (&a.qkv, (pad * QKV * 4) as u64),
-                (&a.logits, logits4),
-                (&a.ids, ids4),
-            ];
-            let blob = self.gpu.readback_many(&parts)?;
-            // Same 4-byte alignment readback_many uses to lay the parts out.
-            let mut offs: Vec<usize> = Vec::new();
-            let mut at = 0usize;
-            for (_, n) in &parts {
-                offs.push(at);
-                at += ((((*n).max(4)) + 3) & !3) as usize;
-            }
-            let seg = |i: usize| -> &[u8] { &blob[offs[i]..offs[i] + parts[i].1 as usize] };
-
-            scan_f32("in", seg(0));
-            scan_f32("h0", seg(1));
-            scan_f32("h1", seg(2));
-            scan_f32("norm", seg(3));
-            scan_f32("ctx", seg(4));
-            scan_f32("qkv", seg(5));
-            scan_f32("logits", seg(6));
-            let row = seg(6);
-            let mut max_v = f32::NEG_INFINITY;
-            let mut max_i = 0usize;
-            let mut nnan = 0u32;
-            let mut v0 = 0f32;
-            for c in 0..VOCAB.min(row.len() / 4) {
-                let v = f32::from_le_bytes([row[c * 4], row[c * 4 + 1], row[c * 4 + 2], row[c * 4 + 3]]);
-                if c == 0 {
-                    v0 = v;
-                }
-                if v.is_nan() {
-                    nnan += 1;
-                } else if v > max_v {
-                    max_v = v;
-                    max_i = c;
-                }
-            }
-            let idbytes = seg(7);
-            let ids_head: Vec<i32> = idbytes
-                .chunks_exact(4)
-                .take(12)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            eprintln!(
-                "gpu debug logit0={v0} max={max_v} at={max_i} nnan={nnan} ids_head={ids_head:?} frames_len={}",
-                frames.len()
-            );
+            self.dump_debug(x, pad, t, ops.len(), &frames)?;
         }
         Ok(greedy(&frames))
     }
@@ -604,6 +577,96 @@ impl GpuEngine {
         Ok(())
     }
 
+    /// `SVS_GPU_DUMP_OPS=1`: print every recorded op with its bind group and
+    /// dispatch shape. Diagnostic only.
+    fn dump_ops(ops: &[Op], pad: usize, t: usize) {
+        eprintln!("gpu ops total={} pad={pad} t={t}", ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            eprintln!(
+                "op {i:4} {:<10} bg={:<4} slot={:<4} dispatch=({},{},{})",
+                pid_name(op.pipe),
+                op.bg,
+                op.slot,
+                op.x,
+                op.y,
+                op.z
+            );
+        }
+    }
+
+    /// `SVS_GPU_DEBUG=1`: scan the intermediate activations of the last run.
+    ///
+    /// Diagnostic only. It reads (never writes) the buffers `encode` just
+    /// filled, so the execution path stays readable and unchanged.
+    fn dump_debug(&self, x: &[f32], pad: usize, t: usize, n_ops: usize, frames: &[i32]) -> Result<()> {
+        let xmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        eprintln!(
+            "gpu debug x_max={xmax} slot={} ops={} pad={pad} t={t}",
+            self.slot,
+            n_ops
+        );
+        let a = self.acts.as_ref().unwrap();
+        let hid4 = (pad * HIDDEN * 4) as u64;
+        let norm4 = (pad * 560 * 4) as u64;
+        let logits4 = ((t * VOCAB * 4) as u64).min((pad * CTC_PAD * 4) as u64);
+        let ids4 = (t * 4) as u64;
+        let parts: Vec<(&wgpu::Buffer, u64)> = vec![
+            (&a.in560, 64),
+            (&a.h0, hid4),
+            (&a.h1, hid4),
+            (&a.norm, norm4),
+            (&a.ctx, hid4),
+            (&a.qkv, (pad * QKV * 4) as u64),
+            (&a.logits, logits4),
+            (&a.ids, ids4),
+        ];
+        let blob = self.gpu.readback_many(&parts)?;
+        // Same 4-byte alignment readback_many uses to lay the parts out.
+        let mut offs: Vec<usize> = Vec::new();
+        let mut at = 0usize;
+        for (_, n) in &parts {
+            offs.push(at);
+            at += ((((*n).max(4)) + 3) & !3) as usize;
+        }
+        let seg = |i: usize| -> &[u8] { &blob[offs[i]..offs[i] + parts[i].1 as usize] };
+
+        scan_f32("in", seg(0));
+        scan_f32("h0", seg(1));
+        scan_f32("h1", seg(2));
+        scan_f32("norm", seg(3));
+        scan_f32("ctx", seg(4));
+        scan_f32("qkv", seg(5));
+        scan_f32("logits", seg(6));
+        let row = seg(6);
+        let mut max_v = f32::NEG_INFINITY;
+        let mut max_i = 0usize;
+        let mut nnan = 0u32;
+        let mut v0 = 0f32;
+        for c in 0..VOCAB.min(row.len() / 4) {
+            let v = f32::from_le_bytes([row[c * 4], row[c * 4 + 1], row[c * 4 + 2], row[c * 4 + 3]]);
+            if c == 0 {
+                v0 = v;
+            }
+            if v.is_nan() {
+                nnan += 1;
+            } else if v > max_v {
+                max_v = v;
+                max_i = c;
+            }
+        }
+        let idbytes = seg(7);
+        let ids_head: Vec<i32> = idbytes
+            .chunks_exact(4)
+            .take(12)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        eprintln!(
+            "gpu debug logit0={v0} max={max_v} at={max_i} nnan={nnan} ids_head={ids_head:?} frames_len={}",
+            frames.len()
+        );
+        Ok(())
+    }
+
     fn record(&self, pad: usize, valid: usize, ban: Option<usize>) -> Result<(Vec<Op>, Vec<u8>)> {
         let slot = self.slot as usize;
         let mut blob = vec![0u8; SLOTS * slot];
@@ -634,7 +697,12 @@ impl GpuEngine {
                         &mut push, &mut ops, Pid::GemmB, layer.qkv, pad_u, QKV as u32,
                         layer.in_dim, QKV as u32, 0, 0, 0, layer.in_dim, 1,
                     )?;
-                    let fsmn_slot = push(bytemuck::bytes_of(&U4 { a: valid_u, b: pad_u, c: 0, d: 0 }))?;
+                    let fsmn_slot = push(bytemuck::bytes_of(&FsmnCfg {
+                        t_valid: valid_u,
+                        t_pad: pad_u,
+                        _p0: 0,
+                        _p1: 0,
+                    }))?;
                     ops.push(Op { pipe: Pid::Fsmn, bg: layer.fsmn, slot: fsmn_slot, x: 2, y: pad_u, z: 1 });
                     let split_slot = push(bytemuck::bytes_of(&SplitCfg {
                         t_pad: pad_u, t_valid: valid_u, scale, p: 0,
@@ -646,16 +714,31 @@ impl GpuEngine {
                         &mut push, &mut ops, Pid::Gemm, plan.qk, pad_u, pad_u, 128, pad_u,
                         bsa, bsa, bsc_scores, 128, 4,
                     )?;
-                    let soft_slot = push(bytemuck::bytes_of(&U4 { a: valid_u, b: pad_u, c: 0, d: 0 }))?;
+                    let soft_slot = push(bytemuck::bytes_of(&SoftCfg {
+                        t_valid: valid_u,
+                        t_pad: pad_u,
+                        _p0: 0,
+                        _p1: 0,
+                    }))?;
                     ops.push(Op { pipe: Pid::Soft, bg: plan.soft, slot: soft_slot, x: 4 * pad_u, y: 1, z: 1 });
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, 128,
                         bsc_scores, bsa, pad_u * 128, pad_u, 4,
                     )?;
-                    let merge_slot = push(bytemuck::bytes_of(&U4 { a: pad_u, b: valid_u, c: 0, d: 0 }))?;
+                    let merge_slot = push(bytemuck::bytes_of(&MergeCfg {
+                        t_pad: pad_u,
+                        t_valid: valid_u,
+                        _p0: 0,
+                        _p1: 0,
+                    }))?;
                     ops.push(Op { pipe: Pid::Merge, bg: plan.merge, slot: merge_slot, x: 1, y: 4, z: pad_u });
                     let n_elem = pad_u * HIDDEN as u32;
-                    let add_slot = push(bytemuck::bytes_of(&U4 { a: n_elem, b: layer.add_mode, c: 0, d: 0 }))?;
+                    let add_slot = push(bytemuck::bytes_of(&AddCfg {
+                        n: n_elem,
+                        mode: layer.add_mode,
+                        _p0: 0,
+                        _p1: 0,
+                    }))?;
                     ops.push(Op {
                         pipe: Pid::Add,
                         bg: layer.add,
@@ -674,7 +757,12 @@ impl GpuEngine {
                         HIDDEN as u32, FFN as u32, 0, 0, 0, HIDDEN as u32, 1,
                     )?;
                     let relu_n = pad_u * FFN as u32;
-                    let relu_slot = push(bytemuck::bytes_of(&U4 { a: relu_n, b: 0, c: 0, d: 0 }))?;
+                    let relu_slot = push(bytemuck::bytes_of(&ReluCfg {
+                        n: relu_n,
+                        _a: 0,
+                        _b: 0,
+                        _c: 0,
+                    }))?;
                     ops.push(Op {
                         pipe: Pid::Relu,
                         bg: plan.relu,
@@ -701,11 +789,11 @@ impl GpuEngine {
             Some(id) => id as u32,
             None => u32::MAX,
         };
-        let arg_slot = push(bytemuck::bytes_of(&U4 {
-            a: valid_u,
-            b: VOCAB as u32,
-            c: CTC_PAD as u32,
-            d: ban_id,
+        let arg_slot = push(bytemuck::bytes_of(&ArgCfg {
+            t_valid: valid_u,
+            n_vocab: VOCAB as u32,
+            stride: CTC_PAD as u32,
+            ban: ban_id,
         }))?;
         ops.push(Op { pipe: Pid::Arg, bg: plan.arg, slot: arg_slot, x: valid_u, y: 1, z: 1 });
 
@@ -1018,8 +1106,6 @@ impl Pipes {
         let arg_pl = pl(&arg_l, "arg");
         Ok(Self {
             ln: gpu.pipeline("ln", &shaders::layernorm(), "layernorm", &ln_pl)?,
-            ln_f32_f16: gpu.pipeline("ln32", &shaders::layernorm(), "layernorm", &ln_pl)?,
-            ln_f32: gpu.pipeline("lnf", &shaders::layernorm(), "layernorm", &ln_pl)?,
             gemm: gpu.pipeline("gemm", &gemm_f32(false, false, false), "gemm", &gemm_pl)?,
             gemm_nt: gpu.pipeline("gemm-nt", &gemm_f32(true, false, false), "gemm", &gemm_pl)?,
             gemm_b: gpu.pipeline("gemm-b", &gemm_f32_bias(false), "gemm", &gemm_b_pl)?,
@@ -1046,9 +1132,9 @@ impl Pipes {
 
     fn get(&self, id: Pid) -> &wgpu::ComputePipeline {
         match id {
-            Pid::Ln => &self.ln,
-            Pid::LnF32F16 => &self.ln_f32_f16,
-            Pid::LnF32 => &self.ln_f32,
+            // One WGSL source, one layout: the three Ln ids differ only in
+            // which buffer they bind, never in behaviour.
+            Pid::Ln | Pid::LnF32F16 | Pid::LnF32 => &self.ln,
             Pid::Gemm => &self.gemm,
             Pid::GemmNt => &self.gemm_nt,
             Pid::GemmB => &self.gemm_b,
