@@ -629,3 +629,183 @@ fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
 "
     .to_string()
 }
+
+/// Pre-segment-mask variant: single-utterance runs take this one, so the
+/// per-element mask check never runs on the plain path.
+pub fn softmax_plain() -> String {
+    "struct SoftCfg { t_valid: u32, t_pad: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read_write> S: array<f32>;
+@group(0) @binding(1) var<uniform> cfg: SoftCfg;
+var<workgroup> red: array<f32, 256>;
+
+fn score_at(row: u32, j: u32) -> f32 {
+    return S[row * cfg.t_pad + j];
+}
+
+@compute @workgroup_size(256)
+fn softmax_plain(@builtin(workgroup_id) wid: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.x;
+    let lane = lid.x;
+    let n = cfg.t_pad;
+    let valid = cfg.t_valid;
+    var m = -1.0e30;
+    for (var j: u32 = lane; j < valid; j = j + 256u) {
+        m = max(m, score_at(row, j));
+    }
+    red[lane] = m;
+    workgroupBarrier();
+    for (var off: u32 = 128u; off > 0u; off = off >> 1u) {
+        if (lane < off) { red[lane] = max(red[lane], red[lane + off]); }
+        workgroupBarrier();
+    }
+    let maxv = red[0];
+    var sum = 0.0;
+    for (var j: u32 = lane; j < valid; j = j + 256u) {
+        sum = sum + exp(score_at(row, j) - maxv);
+    }
+    red[lane] = sum;
+    workgroupBarrier();
+    for (var off: u32 = 128u; off > 0u; off = off >> 1u) {
+        if (lane < off) { red[lane] = red[lane] + red[lane + off]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / red[0];
+    for (var j: u32 = lane; j < n; j = j + 256u) {
+        var v = 0.0;
+        if (j < valid) { v = exp(score_at(row, j) - maxv) * inv; }
+        S[row * n + j] = v;
+    }
+}
+"
+    .to_string()
+}
+
+/// Pre-segment-mask variant: single-utterance runs take this one, so the
+/// per-element mask check never runs on the plain path.
+pub fn softmax_cached_plain() -> String {
+    "struct SoftCfg { t_valid: u32, t_pad: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read_write> S: array<f32>;
+@group(0) @binding(1) var<uniform> cfg: SoftCfg;
+var<workgroup> red: array<f32, 256>;
+var<workgroup> row: array<f32, 4096>;
+
+@compute @workgroup_size(256)
+fn softmax_cached_plain(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x;
+    let lane = lid.x;
+    let n = cfg.t_pad;
+    let valid = cfg.t_valid;
+    for (var j: u32 = lane; j < n; j = j + 256u) {
+        row[j] = S[r * n + j];
+    }
+    var m = -1.0e30;
+    for (var j: u32 = lane; j < valid; j = j + 256u) {
+        m = max(m, row[j]);
+    }
+    red[lane] = m;
+    workgroupBarrier();
+    for (var off: u32 = 128u; off > 0u; off = off >> 1u) {
+        if (lane < off) { red[lane] = max(red[lane], red[lane + off]); }
+        workgroupBarrier();
+    }
+    let maxv = red[0];
+    var sum = 0.0;
+    for (var j: u32 = lane; j < valid; j = j + 256u) {
+        sum = sum + exp(row[j] - maxv);
+    }
+    red[lane] = sum;
+    workgroupBarrier();
+    for (var off: u32 = 128u; off > 0u; off = off >> 1u) {
+        if (lane < off) { red[lane] = red[lane] + red[lane + off]; }
+        workgroupBarrier();
+    }
+    let inv = 1.0 / red[0];
+    for (var j: u32 = lane; j < n; j = j + 256u) {
+        var v = 0.0;
+        if (j < valid) { v = exp(row[j] - maxv) * inv; }
+        S[r * n + j] = v;
+    }
+}
+"
+    .to_string()
+}
+
+/// Pre-segment-mask variant: single-utterance runs take this one, so the
+/// per-element mask check never runs on the plain path.
+pub fn fsmn_plain() -> String {
+    // `cfg._p0` is the residual mode: 1 adds the layer input (`Src`) to the
+    // memory output and stores the sum directly, which is what the separate
+    // `add` pass used to do — the same `src + (acc + v)` association, one pass
+    // fewer. 0 stores the memory output alone (layer 0).
+    "struct FsmnCfg { t_valid: u32, t_pad: u32, mode: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read> Qkv: array<f32>;
+/// Tap-major, `[11][512]`: the host transposes the `[512][11]` checkpoint so
+/// the per-tap weight read walks `c` contiguously.
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<uniform> cfg: FsmnCfg;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> Src: array<f32>;
+
+@compute @workgroup_size(256)
+fn fsmn_plain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let t = gid.y;
+    let at = t * 512u + c;
+    if (c >= 512u || t >= cfg.t_pad) { return; }
+    if (t >= cfg.t_valid) {
+        Out[at] = select(0.0, Src[at], cfg.mode == 1u);
+        return;
+    }
+    var acc = 0.0;
+    for (var k: u32 = 0u; k < 11u; k = k + 1u) {
+        let src = i32(t + k) - 5;
+        if (src >= 0 && u32(src) < cfg.t_valid) {
+            let v = Qkv[u32(src) * 1536u + 1024u + c];
+            acc = acc + v * W[k * 512u + c];
+        }
+    }
+    let v = Qkv[t * 1536u + 1024u + c];
+    let mem = acc + v;
+    Out[at] = select(mem, Src[at] + mem, cfg.mode == 1u);
+}
+"
+    .to_string()
+}
+
+/// Pre-segment-mask variant: single-utterance runs take this one, so the
+/// per-element mask check never runs on the plain path.
+pub fn fsmn_rows_plain() -> String {
+    "struct FsmnCfg { t_valid: u32, t_pad: u32, mode: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read> Qkv: array<f32>;
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<uniform> cfg: FsmnCfg;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> Src: array<f32>;
+
+@compute @workgroup_size(256)
+fn fsmn_rows_plain(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let t = gid.y;
+    let at = t * 512u + c;
+    if (c >= 512u || t >= cfg.t_pad) { return; }
+    if (t >= cfg.t_valid) {
+        Out[at] = select(0.0, Src[at], cfg.mode == 1u);
+        return;
+    }
+    var acc = 0.0;
+    for (var k: u32 = 0u; k < 11u; k = k + 1u) {
+        let src = i32(t + k) - 5;
+        if (src >= 0 && u32(src) < cfg.t_valid) {
+            let v = Qkv[u32(src) * 1536u + 1024u + c];
+            acc = acc + v * W[c * 11u + k];
+        }
+    }
+    let v = Qkv[t * 1536u + 1024u + c];
+    let mem = acc + v;
+    Out[at] = select(mem, Src[at] + mem, cfg.mode == 1u);
+}
+"
+    .to_string()
+}

@@ -151,10 +151,15 @@ enum Pid {
     GemmBRelu,
     GemmBTallRelu,
     Fsmn,
+    /// Unmasked variants: single-utterance runs take these so the segment-mask
+    /// check never executes on the common path.
+    FsmnPlain,
     Split,
     Soft,
+    SoftPlain,
     /// [`Soft`] with the row staged in shared memory (pad <= 4096).
     SoftCached,
+    SoftCachePlain,
     Merge,
     Add,
     Relu,
@@ -186,9 +191,12 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::GemmBRelu => "gemm_b_relu",
         Pid::GemmBTallRelu => "gemm_b_tall_relu",
         Pid::Fsmn => "fsmn",
+        Pid::FsmnPlain => "fsmn_plain",
         Pid::Split => "split",
         Pid::Soft => "soft",
+        Pid::SoftPlain => "soft_plain",
         Pid::SoftCached => "soft_cache",
+        Pid::SoftCachePlain => "soft_cache_plain",
         Pid::Merge => "merge",
         Pid::Add => "add",
         Pid::Relu => "relu",
@@ -348,10 +356,14 @@ struct Pipes {
     gemm_b_relu: wgpu::ComputePipeline,
     gemm_b_tall_relu: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
+    fsmn_plain: wgpu::ComputePipeline,
     fsmn_rows: wgpu::ComputePipeline,
+    fsmn_rows_plain: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
+    soft_plain: wgpu::ComputePipeline,
     soft_cached: wgpu::ComputePipeline,
+    soft_cached_plain: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
@@ -675,7 +687,7 @@ impl GpuEngine {
         let ids = self.acts.as_ref().unwrap().ids.clone();
         let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
         let t0 = std::time::Instant::now();
-        let (ops, blob) = self.record(pad, t, ban)?;
+        let (ops, blob) = self.record(pad, t, ban, seg_ids.is_none())?;
         let d_rec = t0.elapsed().as_secs_f64() * 1e3;
         if tuning::gpu_dump_ops() {
             Self::dump_ops(&ops, pad, t);
@@ -1153,7 +1165,13 @@ impl GpuEngine {
         Ok(())
     }
 
-    fn record(&self, pad: usize, valid: usize, ban: Option<usize>) -> Result<(Vec<Op>, Vec<u8>)> {
+    fn record(
+        &self,
+        pad: usize,
+        valid: usize,
+        ban: Option<usize>,
+        plain: bool,
+    ) -> Result<(Vec<Op>, Vec<u8>)> {
         let slot = self.slot as usize;
         let mut blob = vec![0u8; SLOTS * slot];
         let mut n = 0u32;
@@ -1190,7 +1208,8 @@ impl GpuEngine {
                         mode: if fuse_add { layer.add_mode } else { 0 },
                         _p1: 0,
                     }))?;
-                    ops.push(Op { pipe: Pid::Fsmn, bg: layer.fsmn, slot: fsmn_slot, x: 2, y: pad_u, z: 1 });
+                    let fsmn_pipe = if plain { Pid::FsmnPlain } else { Pid::Fsmn };
+                    ops.push(Op { pipe: fsmn_pipe, bg: layer.fsmn, slot: fsmn_slot, x: 2, y: pad_u, z: 1 });
                     let split_slot = push(bytemuck::bytes_of(&SplitCfg {
                         t_pad: pad_u, t_valid: valid_u, scale,
                         p: if tuning::fuse_split() { 1 } else { 0 },
@@ -1214,7 +1233,12 @@ impl GpuEngine {
                     }))?;
                     // The direct kernel re-reads the row three times; up to
                     // 4096 wide it fits in shared memory and costs one read.
-                    let soft_pipe = if pad_u <= 4096 { Pid::SoftCached } else { Pid::Soft };
+                    let soft_pipe = match (pad_u <= 4096, plain) {
+                        (true, true) => Pid::SoftCachePlain,
+                        (true, false) => Pid::SoftCached,
+                        (false, true) => Pid::SoftPlain,
+                        (false, false) => Pid::Soft,
+                    };
                     ops.push(Op { pipe: soft_pipe, bg: plan.soft, slot: soft_slot, x: 4 * pad_u, y: 1, z: 1 });
                     // Fused: C is `ctx` (row stride HIDDEN, head offset 128);
                     // split: C is the per-head `av` buffer.
@@ -1730,10 +1754,24 @@ impl Pipes {
             gemm_b_relu: gpu.pipeline("gemm-b-relu", &gemm_f32_bias_relu(), "gemm", &gemm_b_pl)?,
             gemm_b_tall_relu: gpu.pipeline("gemm-b-small-relu", &gemm_f32_small_relu(), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
+            fsmn_plain: gpu.pipeline("fsmn-plain", &shaders::fsmn_plain(), "fsmn_plain", &fsmn_pl)?,
             fsmn_rows: gpu.pipeline("fsmn-rows", &shaders::fsmn_rows(), "fsmn", &fsmn_pl)?,
+            fsmn_rows_plain: gpu.pipeline(
+                "fsmn-rows-plain",
+                &shaders::fsmn_rows_plain(),
+                "fsmn_rows_plain",
+                &fsmn_pl,
+            )?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
+            soft_plain: gpu.pipeline("soft-plain", &shaders::softmax_plain(), "softmax_plain", &soft_pl)?,
             soft_cached: gpu.pipeline("soft-cache", &shaders::softmax_cached(), "softmax_cached", &soft_pl)?,
+            soft_cached_plain: gpu.pipeline(
+                "soft-cache-plain",
+                &shaders::softmax_cached_plain(),
+                "softmax_cached_plain",
+                &soft_pl,
+            )?,
             merge: gpu.pipeline("merge", &shaders::merge_heads(), "merge", &merge_pl)?,
             add: gpu.pipeline("add", &shaders::add(), "add", &add_pl)?,
             relu: gpu.pipeline("relu", &shaders::relu(), "relu", &relu_pl)?,
@@ -1778,9 +1816,18 @@ impl Pipes {
                     &self.fsmn_rows
                 }
             }
+            Pid::FsmnPlain => {
+                if tuning::fsmn_tap() {
+                    &self.fsmn_plain
+                } else {
+                    &self.fsmn_rows_plain
+                }
+            }
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,
+            Pid::SoftPlain => &self.soft_plain,
             Pid::SoftCached => &self.soft_cached,
+            Pid::SoftCachePlain => &self.soft_cached_plain,
             Pid::Merge => &self.merge,
             Pid::Add => &self.add,
             Pid::Relu => &self.relu,
