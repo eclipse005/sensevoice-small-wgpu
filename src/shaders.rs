@@ -183,6 +183,45 @@ pub fn fsmn() -> String {
     // fewer. 0 stores the memory output alone (layer 0).
     "struct FsmnCfg { t_valid: u32, t_pad: u32, mode: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read> Qkv: array<f32>;
+/// Tap-major, `[11][512]`: the host transposes the `[512][11]` checkpoint so
+/// the per-tap weight read walks `c` contiguously.
+@group(0) @binding(1) var<storage, read> W: array<f32>;
+@group(0) @binding(2) var<uniform> cfg: FsmnCfg;
+@group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> Src: array<f32>;
+
+@compute @workgroup_size(256)
+fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let c = gid.x;
+    let t = gid.y;
+    let at = t * 512u + c;
+    if (c >= 512u || t >= cfg.t_pad) { return; }
+    if (t >= cfg.t_valid) {
+        Out[at] = select(0.0, Src[at], cfg.mode == 1u);
+        return;
+    }
+    var acc = 0.0;
+    for (var k: u32 = 0u; k < 11u; k = k + 1u) {
+        let src = i32(t + k) - 5;
+        if (src >= 0 && u32(src) < cfg.t_valid) {
+            let v = Qkv[u32(src) * 1536u + 1024u + c];
+            acc = acc + v * W[k * 512u + c];
+        }
+    }
+    let v = Qkv[t * 1536u + 1024u + c];
+    let mem = acc + v;
+    Out[at] = select(mem, Src[at] + mem, cfg.mode == 1u);
+}
+"
+    .to_string()
+}
+
+/// The original `[512][11]` weight layout (the same kernel indexed at a
+/// stride-11 gather); `SVS_FSMN_TAP=0` selects this and the host uploads the
+/// untransposed weights.
+pub fn fsmn_rows() -> String {
+    "struct FsmnCfg { t_valid: u32, t_pad: u32, mode: u32, _p1: u32 };
+@group(0) @binding(0) var<storage, read> Qkv: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<uniform> cfg: FsmnCfg;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;

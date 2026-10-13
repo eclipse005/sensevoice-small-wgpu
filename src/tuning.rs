@@ -112,6 +112,13 @@ pub fn fuse_merge() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_MERGE").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_FSMN_TAP=0` uses the checkpoint's `[512][11]` weight layout instead of
+/// the host-transposed tap-major copy.
+pub fn fsmn_tap() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_FSMN_TAP").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_FUSE_SPLIT=0` restores the full split pass (fused: K/V are read
 /// straight from `qkv`, the split only writes Q).
 pub fn fuse_split() -> bool {

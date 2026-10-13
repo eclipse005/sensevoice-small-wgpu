@@ -344,6 +344,7 @@ struct Pipes {
     gemm_b_relu: wgpu::ComputePipeline,
     gemm_b_tall_relu: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
+    fsmn_rows: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
     soft_cached: wgpu::ComputePipeline,
@@ -1601,6 +1602,7 @@ impl Pipes {
             gemm_b_relu: gpu.pipeline("gemm-b-relu", &gemm_f32_bias_relu(), "gemm", &gemm_b_pl)?,
             gemm_b_tall_relu: gpu.pipeline("gemm-b-small-relu", &gemm_f32_small_relu(), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
+            fsmn_rows: gpu.pipeline("fsmn-rows", &shaders::fsmn_rows(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
             soft_cached: gpu.pipeline("soft-cache", &shaders::softmax_cached(), "softmax_cached", &soft_pl)?,
@@ -1641,7 +1643,13 @@ impl Pipes {
             Pid::GemmF32cTall => &self.gemm_f32c_tall,
             Pid::GemmBRelu => &self.gemm_b_relu,
             Pid::GemmBTallRelu => &self.gemm_b_tall_relu,
-            Pid::Fsmn => &self.fsmn,
+            Pid::Fsmn => {
+                if tuning::fsmn_tap() {
+                    &self.fsmn
+                } else {
+                    &self.fsmn_rows
+                }
+            }
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,
             Pid::SoftCached => &self.soft_cached,
@@ -1720,7 +1728,14 @@ fn upload_layer(gpu: &Gpu, slab: &mut Slab, layer: &mut crate::weights::Layer) -
             layer.qkv.rows,
         )?,
         qkv_b: slab_put_bias(slab, gpu, &std::mem::take(&mut layer.qkv.b), layer.qkv.rows)?,
-        fsmn: slab.put(gpu, &std::mem::take(&mut layer.fsmn))?,
+        fsmn: {
+            let w = std::mem::take(&mut layer.fsmn);
+            if tuning::fsmn_tap() {
+                slab.put(gpu, &tap_major(&w))?
+            } else {
+                slab.put(gpu, &w)?
+            }
+        },
         outw: slab_put_mat(
             slab,
             gpu,
@@ -1797,6 +1812,18 @@ fn slab_put_mat(
         v[r * cols..(r + 1) * cols].copy_from_slice(&data[r * cols..(r + 1) * cols]);
     }
     slab.put(gpu, &v)
+}
+
+/// `[512][11]` depthwise weights into `[11][512]`, so the GPU's per-tap weight
+/// read is contiguous instead of a stride-11 gather.
+fn tap_major(w: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; w.len()];
+    for c in 0..512 {
+        for k in 0..11 {
+            out[k * 512 + c] = w[c * 11 + k];
+        }
+    }
+    out
 }
 
 fn slab_put_bias(slab: &mut Slab, gpu: &Gpu, data: &[f32], cols_pad: usize) -> Result<Part> {
