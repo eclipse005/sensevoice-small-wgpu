@@ -24,15 +24,12 @@ const SLOTS: usize = 2048;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GDims {
-    m: u32,
     n: u32,
     k: u32,
     ldc: u32,
     bsa: u32,
     bsb: u32,
     bsc: u32,
-    beta: u32,
-    row0: u32,
     lda: u32,
 }
 
@@ -76,11 +73,8 @@ enum Pid {
     LnF32F16,
     LnF32,
     Gemm,
-    GemmF32,
     GemmNt,
     GemmB,
-    GemmF32A,
-    GemmBb,
     GemmF32c,
     Fsmn,
     Split,
@@ -106,11 +100,8 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::LnF32F16 => "ln_f16",
         Pid::LnF32 => "ln_f32",
         Pid::Gemm => "gemm",
-        Pid::GemmF32 => "gemm_f32",
         Pid::GemmNt => "gemm_nt",
         Pid::GemmB => "gemm_b",
-        Pid::GemmF32A => "gemm_f32a",
-        Pid::GemmBb => "gemm_bb",
         Pid::GemmF32c => "gemm_f32c",
         Pid::Fsmn => "fsmn",
         Pid::Split => "split",
@@ -194,11 +185,8 @@ struct Pipes {
     ln_f32_f16: wgpu::ComputePipeline,
     ln_f32: wgpu::ComputePipeline,
     gemm: wgpu::ComputePipeline,
-    gemm_f32: wgpu::ComputePipeline,
     gemm_nt: wgpu::ComputePipeline,
     gemm_b: wgpu::ComputePipeline,
-    gemm_f32a: wgpu::ComputePipeline,
-    gemm_bb: wgpu::ComputePipeline,
     gemm_f32c: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
@@ -276,10 +264,6 @@ impl GpuEngine {
         };
         engine.alloc_for(512.min(max_t))?;
         Ok(engine)
-    }
-
-    pub fn describe(&self) -> String {
-        self.gpu.describe()
     }
 
     pub fn encode(&mut self, x: &[f32], t: usize, ban: Option<usize>) -> Result<Vec<i32>> {
@@ -388,7 +372,7 @@ impl GpuEngine {
                 .context("poll batch")?;            i = end;
         }
         if prof {
-            self.dump_prof(&qset.unwrap(), &ops);
+            self.dump_prof(&qset.unwrap(), &ops)?;
         }
         let raw = self.gpu.readback(&ids, (t * 4) as u64)?;
         if let Some(err) = pollster::block_on(guard.pop()) {
@@ -469,18 +453,6 @@ impl GpuEngine {
     }
 }
 
-fn f16_at(bytes: &[u8], elem: usize) -> f32 {
-    let word = u32::from_le_bytes(bytes[elem / 2 * 4..elem / 2 * 4 + 4].try_into().unwrap());
-    let bits = if elem % 2 == 0 { word & 0xffff } else { word >> 16 };
-    half::f16::from_bits(bits as u16).to_f32()
-}
-
-fn dump_f16(name: &str, bytes: &[u8]) {
-    let n = bytes.len() / 2;
-    let vals: Vec<f32> = (0..n).map(|i| f16_at(bytes, i)).collect();
-    eprintln!("gpu debug {name} {vals:?}");
-}
-
 fn scan_f32(name: &str, bytes: &[u8]) {
     let mut nnan = 0u32;
     let mut ninf = 0u32;
@@ -489,24 +461,6 @@ fn scan_f32(name: &str, bytes: &[u8]) {
     for c in bytes.chunks_exact(4) {
         let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         n += 1;
-        if v.is_nan() {
-            nnan += 1;
-        } else if v.is_infinite() {
-            ninf += 1;
-        } else {
-            max = max.max(v.abs());
-        }
-    }
-    eprintln!("gpu debug {name} n={n} nnan={nnan} ninf={ninf} max={max}");
-}
-
-fn scan_f16(name: &str, bytes: &[u8]) {
-    let n = bytes.len() / 2;
-    let mut nnan = 0u32;
-    let mut ninf = 0u32;
-    let mut max = 0f32;
-    for i in 0..n {
-        let v = f16_at(bytes, i);
         if v.is_nan() {
             nnan += 1;
         } else if v.is_infinite() {
@@ -789,7 +743,7 @@ fn push_gemm(
     lda: u32,
     z: u32,
 ) -> Result<()> {
-    let g = GDims { m, n, k, ldc, bsa, bsb, bsc, beta: 0, row0: 0, lda };
+    let g = GDims { n, k, ldc, bsa, bsb, bsc, lda };
     let slot = push(bytemuck::bytes_of(&g))?;
     ops.push(Op { pipe, bg, slot, x: n / TILE, y: m / TILE, z });
     Ok(())
@@ -1067,11 +1021,8 @@ impl Pipes {
             ln_f32_f16: gpu.pipeline("ln32", &shaders::layernorm(), "layernorm", &ln_pl)?,
             ln_f32: gpu.pipeline("lnf", &shaders::layernorm(), "layernorm", &ln_pl)?,
             gemm: gpu.pipeline("gemm", &gemm_f32(false, false, false), "gemm", &gemm_pl)?,
-            gemm_f32: gpu.pipeline("gemm-f32", &gemm_f32(false, false, false), "gemm", &gemm_pl)?,
             gemm_nt: gpu.pipeline("gemm-nt", &gemm_f32(true, false, false), "gemm", &gemm_pl)?,
             gemm_b: gpu.pipeline("gemm-b", &gemm_f32_bias(false), "gemm", &gemm_b_pl)?,
-            gemm_f32a: gpu.pipeline("gemm-f32a", &gemm_f32_bias(false), "gemm", &gemm_b_pl)?,
-            gemm_bb: gpu.pipeline("gemm-bb", &gemm_f32_bias(true), "gemm", &gemm_b_pl)?,
             gemm_f32c: gpu.pipeline("gemm-f32c", &gemm_f32_bias(true), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
@@ -1099,11 +1050,8 @@ impl Pipes {
             Pid::LnF32F16 => &self.ln_f32_f16,
             Pid::LnF32 => &self.ln_f32,
             Pid::Gemm => &self.gemm,
-            Pid::GemmF32 => &self.gemm_f32,
             Pid::GemmNt => &self.gemm_nt,
             Pid::GemmB => &self.gemm_b,
-            Pid::GemmF32A => &self.gemm_f32a,
-            Pid::GemmBb => &self.gemm_bb,
             Pid::GemmF32c => &self.gemm_f32c,
             Pid::Fsmn => &self.fsmn,
             Pid::Split => &self.split,

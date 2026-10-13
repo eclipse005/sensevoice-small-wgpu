@@ -10,11 +10,8 @@ mod ctc;
 mod encoder_cpu;
 mod encoder_gpu;
 mod frontend;
-#[allow(dead_code)]
 mod gemm_f32;
-mod gemm_shader;
 mod gpu;
-mod pack;
 mod pt;
 mod postprocess;
 mod shaders;

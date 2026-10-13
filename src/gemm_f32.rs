@@ -196,8 +196,8 @@ pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
 
     format!(
         r#"struct GDims {{
-    m: u32, n: u32, k: u32, ldc: u32,
-    bsa: u32, bsb: u32, bsc: u32, beta: u32, row0: u32, lda: u32,
+    n: u32, k: u32, ldc: u32,
+    bsa: u32, bsb: u32, bsc: u32, lda: u32,
 }};
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;

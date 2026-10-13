@@ -39,7 +39,6 @@ pub struct Prepared {
     /// `[t, 560]`, queries prepended, scaled by `sqrt(512)`, sinusoidal PE added.
     pub x: Vec<f32>,
     pub t: usize,
-    pub n_fbank: usize,
     pub n_lfr: usize,
     /// Sum of LFR-CMVN features, before the four query rows.
     pub feat_sum: f32,
@@ -91,7 +90,6 @@ impl Frontend {
         Ok(Prepared {
             x,
             t,
-            n_fbank,
             n_lfr,
             feat_sum,
         })
@@ -321,7 +319,6 @@ mod tests {
         assert_eq!(samples.len(), 240_000);
         let embed = vec![0f32; 16 * EMBED_DIM];
         let prep = front.prepare(&samples, &embed, 0, 14).unwrap();
-        assert_eq!(prep.n_fbank, 1498);
         assert_eq!(prep.n_lfr, 250);
         assert_eq!(prep.t, 254);
         let gold = 3235.64599609375f32;

@@ -1362,7 +1362,6 @@ dependencies = [
  "bytemuck",
  "gemm",
  "gemm-common",
- "half",
  "hound",
  "pollster",
  "rayon",

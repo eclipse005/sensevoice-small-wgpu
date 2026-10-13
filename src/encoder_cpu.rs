@@ -119,10 +119,6 @@ impl CpuEngine {
         Self { weights }
     }
 
-    pub fn embed(&self) -> &[f32] {
-        &self.weights.embed
-    }
-
     /// Greedy CTC token ids for one utterance. `x` is `[t, 560]` already scaled and position-encoded.
     pub fn encode(&self, x: &[f32], t: usize, ban: Option<usize>) -> Vec<i32> {
         let mut prof = Prof {
@@ -212,7 +208,7 @@ impl CpuEngine {
         prof: &mut Prof,
     ) {
         let d_in = layer.in_dim;
-        tprof!(prof, ln, layer_norm(&mut s.norm, x, &layer.n1_w, &layer.n1_b, t, d_in));
+        tprof!(prof, ln, layer_norm(&mut s.norm, x, &layer.n1_w, &layer.n1_b, d_in));
         trace_f("norm", &s.norm);
         sanm(&mut s, layer, t, prof);
         tprof!(prof, tail, if residual {
@@ -223,7 +219,7 @@ impl CpuEngine {
         } else {
             dst.copy_from_slice(&s.y);
         });
-        tprof!(prof, ln2, layer_norm(&mut s.norm2, dst, &layer.n2_w, &layer.n2_b, t, HIDDEN));
+        tprof!(prof, ln2, layer_norm(&mut s.norm2, dst, &layer.n2_w, &layer.n2_b, HIDDEN));
         let rows = layer.w1.rows;
         if bias_fold() {
             tprof!(prof, w1, linear_gemm(&mut s.mid, &s.norm2, &layer.w1.w, t, HIDDEN, rows));
@@ -474,7 +470,7 @@ fn ctc_tile() -> usize {
     }
 }
 
-fn layer_norm(y: &mut [f32], x: &[f32], w: &[f32], b: &[f32], t: usize, d: usize) {
+fn layer_norm(y: &mut [f32], x: &[f32], w: &[f32], b: &[f32], d: usize) {
     // Rows are independent; each row's mean and variance keep their order.
     y.par_chunks_mut(d)
         .zip(x.par_chunks(d))
@@ -688,8 +684,9 @@ fn unpin(saved: usize) {
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn l1d_bytes() -> Option<u64> {
     for sub in 0..16u32 {
-        // SAFETY: CPUID is always available on x86_64.
-        let r = unsafe { std::arch::x86_64::__cpuid_count(4, sub) };
+        // CPUID is always available on x86_64, and `__cpuid_count` is a safe
+        // intrinsic there since Rust 1.87.
+        let r = std::arch::x86_64::__cpuid_count(4, sub);
         let cache_type = r.eax & 0x1f;
         if cache_type == 0 {
             break;

@@ -1,4 +1,4 @@
-//! Small compute shaders. The GEMM itself lives in `gemm_shader`.
+//! Small compute shaders. The GEMM itself lives in `gemm_f32`.
 
 pub fn layernorm() -> String {
     "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
@@ -183,89 +183,6 @@ fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
         o = A[i] + B[i];
     }
     D[i] = o;
-}
-"
-    .to_string()
-}
-
-/// Layer-norm from an f32 row (the hidden state) into packed f16.
-pub fn layernorm_f32_f16() -> String {
-    "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
-@group(0) @binding(0) var<storage, read>       Src: array<f32>;
-@group(0) @binding(1) var<storage, read>       Wgt: array<u32>;
-@group(0) @binding(2) var<storage, read>       Bia: array<u32>;
-@group(0) @binding(3) var<uniform>             cfg: LnCfg;
-@group(0) @binding(4) var<storage, read_write> Dst: array<u32>;
-
-@compute @workgroup_size(32)
-fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
-             @builtin(local_invocation_id) lid: vec3<u32>) {
-    let d = cfg.d;
-    let row = wid.x * 32u + lid.x;
-    let base = row * d;
-    var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + Src[base + j];
-    }
-    mean = mean / f32(d);
-    var var_ = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let z = Src[base + j] - mean;
-        var_ = var_ + z * z;
-    }
-    var_ = var_ / f32(d);
-    let inv = 1.0 / sqrt(var_ + cfg.eps);
-    let dst = row * (d / 2u);
-    for (var w: u32 = 0u; w < d / 2u; w = w + 1u) {
-        let g = unpack2x16float(Wgt[w]);
-        let b = unpack2x16float(Bia[w]);
-        let x0 = Src[base + w * 2u];
-        let x1 = Src[base + w * 2u + 1u];
-        Dst[dst + w] = pack2x16float(vec2<f32>(
-            (x0 - mean) * inv * g.x + b.x,
-            (x1 - mean) * inv * g.y + b.y,
-        ));
-    }
-}
-"
-    .to_string()
-}
-
-/// Layer-norm that stays in f32. Used when the next layer reads the hidden state.
-pub fn layernorm_f32() -> String {
-    "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
-@group(0) @binding(0) var<storage, read>       Src: array<f32>;
-@group(0) @binding(1) var<storage, read>       Wgt: array<u32>;
-@group(0) @binding(2) var<storage, read>       Bia: array<u32>;
-@group(0) @binding(3) var<uniform>             cfg: LnCfg;
-@group(0) @binding(4) var<storage, read_write> Dst: array<f32>;
-
-@compute @workgroup_size(32)
-fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
-             @builtin(local_invocation_id) lid: vec3<u32>) {
-    let d = cfg.d;
-    let row = wid.x * 32u + lid.x;
-    let base = row * d;
-    var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + Src[base + j];
-    }
-    mean = mean / f32(d);
-    var var_ = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let z = Src[base + j] - mean;
-        var_ = var_ + z * z;
-    }
-    var_ = var_ / f32(d);
-    let inv = 1.0 / sqrt(var_ + cfg.eps);
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let w = j / 2u;
-        let g = unpack2x16float(Wgt[w]);
-        let b = unpack2x16float(Bia[w]);
-        let gv = select(g.y, g.x, (j & 1u) == 0u);
-        let bv = select(b.y, b.x, (j & 1u) == 0u);
-        Dst[base + j] = (Src[base + j] - mean) * inv * gv + bv;
-    }
 }
 "
     .to_string()

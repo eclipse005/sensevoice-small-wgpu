@@ -13,7 +13,6 @@ path = "src/bin/sensevoice.rs"
 [dependencies]
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
-half = "2"
 hound = "3"
 gemm = "0.18"
 # Same version `gemm` itself links against, so this resolves to the one crate
