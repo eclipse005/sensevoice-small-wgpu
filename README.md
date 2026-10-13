@@ -1,66 +1,204 @@
-# SenseVoiceSmall（Rust CPU + wgpu）
+# SenseVoiceSmall wgpu
 
-对齐目标是官方推理图在 **dither = 0** 时的结果。FunASR `WavFrontend` 默认 `dither=1.0`，每帧加随机噪声，不能逐位对齐。不要拿一次带 dither 的 FunASR 输出当 gold。
+**SenseVoiceSmall speech recognition in Rust with wgpu.**
 
-VAD 模型不内置。调用方传入毫秒段，或整段转写。官方 `merge_vad` 的游标从 0 开始，会改写精确的段，所以默认不合并。要复现官方 demo 的 15 秒合并，再传 `--merge-ms 15000`。一段超过 GPU 缓冲时直接报错，不会按时间悄悄切开。
+**English** · [简体中文](README.zh-CN.md)
 
-CPU f32 是对齐基准。GPU 同为 f32 存储与累加，6 个 fixtures 上 GPU 与 CPU 的 token id 逐个一致，但短音频偶发分歧时仍以 CPU 为准。
+A lightweight, cross-platform Rust implementation of [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice), using [wgpu](https://github.com/gfx-rs/wgpu) for GPU acceleration.
 
-## 选 CPU 还是 GPU
+The goal is simple: run SenseVoiceSmall **locally and natively** without Python or vendor-specific GPU runtimes — and stay **token-for-token aligned** with the official graph.
 
-实测（P104-100 / 8 GB / Vulkan，20 核 CPU，dither=0，整段转录；2026-10-13 最终）：
+### Features
 
-| 素材 | 原版 FunASR CPU | 本仓 CPU | 原版 FunASR CUDA（热） | 本仓 GPU |
+* 🦀 Pure Rust
+* 🎮 GPU acceleration with wgpu
+* 🌍 Cross-platform GPU support (Vulkan / DX12 / Metal)
+* 🖥️ Windows / macOS / Linux
+* ⚡ CPU fallback (the alignment oracle)
+* 📦 Offline local inference
+* 🎙️ SenseVoiceSmall — `zh` / `en` / `yue` / `ja` / `ko`
+* 🔤 Language forcing, ITN on/off, emotion / event tags
+* ✂️ **VAD-agnostic** — you supply the cut points, the engine does the rest
+* 🧩 CLI + Rust library
+* 🔢 f32 everywhere — no f16 / bf16, no quantisation
+* 🎯 Aligned with the official FunASR graph at `dither = 0`
+
+### Install
+
+As a Cargo dependency:
+
+```toml
+[dependencies]
+sensevoice-small-wgpu = { git = "https://github.com/eclipse005/sensevoice-small-wgpu.git" }
+```
+
+Or build the CLI from source:
+
+```bash
+git clone https://github.com/eclipse005/sensevoice-small-wgpu.git
+cd sensevoice-small-wgpu
+cargo build --release        # target/release/sensevoice
+```
+
+### Model download
+
+Weights are **not** included in this repository. Download the official checkpoint (rights remain with the original authors) and pass the directory to `--model` unchanged:
+
+- [FunAudioLLM/SenseVoiceSmall](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) (Hugging Face)
+- [iic/SenseVoiceSmall](https://modelscope.cn/models/iic/SenseVoiceSmall) (ModelScope)
+
+The directory must contain `model.pt`, `am.mvn` and `chn_jpn_yue_eng_ko_spectok.bpe.model`.
+
+**No VAD model is bundled.** This crate answers to the same structure as FunASR — the VAD is a separate model and the ASR only wants its cut points. Get segments from any VAD (including FunASR's `fsmn-vad`, e.g. with `max_single_segment_time = 30000`) and pass them as `[start_ms, end_ms]` pairs.
+
+### Quick Start
+
+```bash
+sensevoice --model ./SenseVoiceSmall --wav ./audio.wav
+```
+
+The run prints the device in use, timings and RTFx on stderr, and the transcript on stdout.
+
+| Option | Description |
+|--------|-------------|
+| `--model <dir>` | Model directory (default `D:\SenseVoiceSmall\model\SenseVoiceSmall`) |
+| `--wav <file>` | wav / mp3 / flac; non-16 kHz is resampled internally |
+| `--lang <name>` | `auto` (default) / `zh` / `en` / `yue` / `ja` / `ko` / `nospeech` |
+| `--itn` / `--no-itn` | Inverse text normalisation, **on by default** (punctuation + number formatting) |
+| `--vad-segments <json>` | Cut points: `[[start_ms,end_ms],…]` or `[{"start_ms":…,"end_ms":…}]`; `@file` reads them from a file |
+| `--merge-ms <n>` | `0` (default) keeps the cuts exactly as given. `15000` reproduces FunASR `merge_vad` with `merge_length_s=15` (the cursor starts at 0, so leading silence is pulled in) |
+| `--ban-emo-unk` | Mask the CTC `emo_unk` token (id 25009) |
+| `--raw` | Print the untagged token text (`<\|en\|><\|NEUTRAL\|>…`) instead of the cleaned transcript |
+| `--check-gold <file>` | Compare token ids / text / raw against a reference JSON; exit code 1 on mismatch |
+| `--device <spec>` | `auto` (default), `cpu`, `vulkan[:i]`, `dx12`, `metal`, `#n`, or a name substring such as `P104` |
+| `--list-devices` | List the devices usable on this machine |
+
+Transcribing with explicit cut points:
+
+```bash
+sensevoice --model ./SenseVoiceSmall --wav ./long.wav --vad-segments '[[1690,2280],[4750,6060],[7840,12100]]'
+sensevoice --model ./SenseVoiceSmall --wav ./long.wav --vad-segments @cuts.json --merge-ms 15000
+```
+
+### Library
+
+```rust
+use sensevoice_small_wgpu::{load_audio, Model, Options, Segment};
+use std::path::Path;
+
+let samples = load_audio(Path::new("audio.wav"))?;              // 16 kHz mono f32
+let mut model = Model::load(Path::new("SenseVoiceSmall"), "P104")?;
+model.reserve_samples(samples.len())?;                          // pre-allocate, outside the clock
+
+let opt = Options {
+    language: "auto".into(),
+    use_itn: true,
+    ban_emo_unk: false,
+    // Exactly what a VAD produces. Empty = transcribe the whole clip.
+    segments: cuts.iter()
+        .map(|(s, e)| Segment { start_ms: *s, end_ms: *e })
+        .collect(),
+    // 0.0 keeps the cuts; 15000.0 runs the official merge_vad (merge_length_s = 15).
+    merge_ms: 0.0,
+};
+
+let out = model.transcribe(&samples, &opt)?;
+println!("{}", out.text);            // out.raw keeps the <|en|><|NEUTRAL|>… tags
+for seg in &out.segments {
+    println!("{:>8.0}–{:<8.0} {}", seg.start_ms, seg.end_ms, seg.raw);
+}
+```
+
+A model is loaded once and reused across calls. `Transcript` also carries `language`, `emotion`,
+`event`, `itn`, per-segment `token_ids`, and a `Timing { frontend_ms, encode_ms, decode_ms, audio_s, rtfx }`.
+
+Segment semantics match FunASR `inference_with_vad` exactly: `start = int(ms * 16)` (truncated),
+`end = min(int(ms * 16), len)`, the audio **after the last cut is not transcribed**, and the
+per-segment texts are joined with single spaces.
+
+### Performance
+
+RTFx (audio seconds per wall second), no model load, medians of 5, on a P104-100 / Vulkan box.
+Whole-clip transcription:
+
+| Clip | FunASR CPU | **this CPU** | FunASR CUDA (warm) | **this GPU** |
 |---|---|---|---|---|
-| 15s_en | 30.30 | **70.3** | 193.1 | **205.1** |
-| 30s_zh | 31.67 | **95.4** | 239.8 | **246.7** |
-| 90s_en | 25.39 | **88.5** | 192.8 | **219.7** |
-| 90s_ja | 24.77 | **90.6** | 213.4 | **218.1** |
-| 180s_en | 17.57 | **65.7** | 146.1 | **175.9** |
-| 180s_zh | 15.66 | **65.0** | 145.6 | **169.0** |
+| 15s_en | 30.30 | **70.3** | 193.1 | **201.0** |
+| 30s_zh | 31.67 | **95.4** | 239.8 | **246.5** |
+| 90s_en | 25.39 | **88.5** | 192.8 | **219.6** |
+| 90s_ja | 24.77 | **90.6** | 213.4 | **217.9** |
+| 180s_en | 17.57 | **65.7** | 146.1 | **176.0** |
+| 180s_zh | 15.66 | **65.0** | 145.6 | **169.3** |
 
-RTFx。两条路径的 6 个 fixtures 都是逐 token 对齐 gold。
+With real VAD cut points (official `fsmn-vad`, `max_single_segment_time = 30000`):
 
-CPU 压过原版 CPU 2.2–3.0 倍。GPU 在 5/6 素材上达到或反超原版 CUDA（15s +2%、90s_en +11%、180s +17%，
-30s/90s_ja 差 0.6–0.7%）；峰值 RAM **6/6 低于 CUDA**（0.90–0.95 GB vs 1.33–1.58）。
-对比公平性：CUDA 数字是 warmup 后中位（旧表的 15s=25.84 是冷启动污染），但 FunASR 默认
-`batch_size_s=60` 会把长音频分块跑，注意力成本低于本仓的整段图；本仓为连续 3 次中位。
-GPU 路径的 frontend（fbank/FFT、LFR、CMVN、位置编码）与全部编码器算子都在显卡上，CPU 每次
-转写只上传样本并回读 token id。手写 WGSL GEMM 的 epilogue 已全 vec4 化，目前约 3 TFLOP/s
-（cuBLAS 同机标定 5.8）。
+| Clip | official full pipeline | **this GPU** |
+|---|---|---|
+| 180s_en (50 cuts) | 85 | **190.3** |
+| 180s_zh (58 cuts) | 89 | **143.3** |
+| 90s_ja (16 cuts) | 57 | **228.2** |
+| 90s_en (16 cuts) | 48 | **204.3** |
+| 180s_en + `merge_length_s=15` | 118 | **193.9** |
+| 180s_zh + `merge_length_s=15` | 101 | **202.9** |
 
-## 寄存器而不是数组
+Memory: peak process RAM 969–979 MiB against CUDA's 1.33–1.58 GB (lower on all six clips).
+Peak device VRAM is lower on five of six; the 15 s clip is +4.7 %.
 
-GEMM 的 `TM×TN` 微块累加器必须写成**具名标量**。`array<array<f32, 8>, 8>` 虽然是合法 WGSL，但 naga/DXIL 允许把它放进 private memory —— 在 NVIDIA 上那由显存支撑，于是每次 FMA 都要一次 load 加一次 store。把数组换成标量后单次前向快了约 20 倍，k 的归约顺序不变，结果逐位一致。
+### Fidelity
 
-分块参数 TM=8 / TN=8 / BK=8 是实测最优；BK=16 慢约 5%，BK=32 无差别。
+* **f32 only.** GPU weights and activations are f32, accumulation stays f32. The CPU path is the
+  reference; the GPU path tracks it token-for-token.
+* **`dither = 0` is the target.** FunASR's `WavFrontend` defaults to `dither = 1.0`, which adds
+  noise per frame and makes the reference *non-reproducible* — two consecutive `generate()` calls
+  on the same audio return different text. Comparisons must force `dither = 0`
+  (see `tools/mini_eval/dither0.py`), or the "reference" differs run to run.
+* **Evidence** (all re-runnable, see `docs/evidence/README.md`): 6 acceptance clips match FunASR's
+  token ids on both CPU and GPU; a 80-clip FLEURS subset (en / zh / ja / yue) is **80/80
+  character-identical** to FunASR under matched `dither = 0` conditions; the VAD path is **8/8**
+  against `inference_with_vad`; the CPU stage trace is byte-identical over 78 stages.
+* Multi-segment runs concatenate the cuts into a single encoder pass with a block-diagonal
+  attention/FSMN mask; per-row argmax is bit-identical to running the segments one at a time.
 
-## Windows TDR
+### Environment switches
 
-GPU 一次提交跑超过约 2 秒会被 Windows 判定为挂起并复位设备。复位后所有 dispatch 变成空操作，`ids` 保持全零，**解码结果是空的但退出码为 0**。
+Every optimisation has a same-binary rollback (see `src/tuning.rs`):
 
-整张图约 984 个 dispatch，所以按批次提交并逐批等待。批次大小随 `t` 反比缩放（`1400000 / t`，夹在 16..2048），目标每批约 1.1 秒；实测 T=1504 可单提交，T=3004 不行。批间等待约占 encode 的 1%。`SVS_GPU_CHUNK` 可覆盖，`SVS_GPU_STOP` 可截断指令流用于定位。
+| Variable | Effect when set to `0` |
+|---|---|
+| `SVS_TILE_SMALL` | use the 128×128 GEMM tile everywhere |
+| `SVS_TILE_WIDE` | keep N=512 projections on the 64×64 tile |
+| `SVS_FUSE_RELU` / `SVS_FUSE_ADD` / `SVS_FUSE_MERGE` / `SVS_FUSE_SPLIT` | disable the respective fusion |
+| `SVS_FSMN_TAP` / `SVS_FSMN_FLAT` | use the checkpoint's FSMN weight layout |
+| `SVS_BIAS_FOLD` | keep the separate bias pass |
+| `SVS_RB_FUSED` | read the transcript back through the one-shot staging path |
+| `SVS_SEG_CONCAT` | process VAD segments one at a time |
 
-## 构建
+Diagnostics: `SVS_TRACE`, `SVS_TRACE_FINE`, `SVS_CPU_PROF`, `SVS_GPU_PROF`, `SVS_GPU_DEBUG`,
+`SVS_GPU_DUMP_OPS`, `SVS_GPU_STOP`, `SVS_GPU_CHUNK`.
 
-```
-cargo build --release
-```
+### Why wgpu?
 
-直接读官方目录里的 `model.pt`、`am.mvn` 和 `chn_jpn_yue_eng_ko_spectok.bpe.model`。数值就是这份检查点，不用再导出 safetensors。
+Instead of relying on CUDA, ROCm, or other vendor-specific runtimes, this project uses **wgpu** as
+a unified GPU abstraction, so one Rust binary runs on different platforms and GPU vendors.
 
-## 命令
+### Project Status
 
-```
-sensevoice --wav D:\SenseVoiceSmall\fixtures\15s_en.wav --device cpu --check-gold gold\15s_en.json
-sensevoice --wav clip.wav --device auto
-sensevoice --wav clip.wav --vad-segments "[[0,15000],[15000,30000]]"
-sensevoice --wav clip.wav --vad-segments @segments.json --merge-ms 15000
-sensevoice --list-devices
-```
+✅ **Working and verified** — CLI and library, CPU and GPU, with the fidelity evidence above.
+Development focused on GPU throughput and memory; the segmented path, the API surface and the
+sibling project's conventions are still being polished.
 
-`--device`：`auto`、`cpu`、`vulkan`、`dx12`、`#n`，或适配器名称的一部分。立体声先转单声道。采样率不是 16 kHz 时，用 torchaudio 默认的 `sinc_interp_hann`（width 6，rolloff 0.99），和参考脚本一致。
+### Related
 
-语言 `--lang auto|zh|en|yue|ja|ko|nospeech`。ITN 默认开，`--no-itn` 关掉。
+* [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) — the official model project
+* [FunASR](https://github.com/modelscope/FunASR) — the official inference framework this port aligns to
+* [wgpu](https://github.com/gfx-rs/wgpu)
+* [qwen3-asr-wgpu](https://github.com/eclipse005/qwen3-asr-wgpu) — the sibling Rust + wgpu ASR port
 
-stdout 是后处理文本（`--raw` 则是带 `<|en|>` 这类标签的原文）。stderr 是设备、frontend / encode / decode 毫秒、音频秒数和 RTFx。RTFx 从权重进显存、pipeline 编译完之后才计时。
+### License
+
+MIT, matching `Cargo.toml`.
+
+This repository is an **independent Rust inference implementation** for loading and running the
+officially released SenseVoiceSmall weights — not an official FunAudioLLM / Alibaba release, and
+not affiliated with the original authors. Model weights remain under the terms of their respective
+owners.
