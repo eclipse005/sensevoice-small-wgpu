@@ -1,0 +1,8 @@
+# 峰值 devVRAM（bench_mem.ps1，nvidia-smi 逐进程采样）
+# CUDA 对照（objective）: 1044/1112/1438/1438/2144/2172 MiB
+15s_en | [    0s] RAM=  0.139 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.139 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1093 MiB | killed        : False | rtfx: 202.35
+30s_zh | [    0s] RAM=  0.125 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.125 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1091 MiB | killed        : False | rtfx: 242.38
+90s_en | [    0s] RAM=  0.016 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.016 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1349 MiB | killed        : False | rtfx: 218.26
+90s_ja | [    0s] RAM=  0.144 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.144 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1349 MiB | killed        : False | rtfx: 216.26
+180s_en | [    0s] RAM=  0.096 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.096 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1631 MiB | killed        : False | rtfx: 175.73
+180s_zh | [    0s] RAM=  0.112 GB  procVRAM=     0 MiB  devVRAM=     0 MiB  (peak RAM=0.112 GB, peak proc=0 MiB, peak dev=0 MiB) | PEAK devVRAM   : 1643 MiB | killed        : False | rtfx: 169.14

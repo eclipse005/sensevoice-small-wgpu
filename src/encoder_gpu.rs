@@ -624,18 +624,24 @@ impl GpuEngine {
         let pad = self.ensure(t)?;
         let ids = self.acts.as_ref().unwrap().ids.clone();
         let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
+        let t0 = std::time::Instant::now();
         let (ops, blob) = self.record(pad, t, ban)?;
+        let d_rec = t0.elapsed().as_secs_f64() * 1e3;
         if tuning::gpu_dump_ops() {
             Self::dump_ops(&ops, pad, t);
         }
+        let t0 = std::time::Instant::now();
         self.gpu.write_at(&self.uni, 0, &blob);
+        let d_up = t0.elapsed().as_secs_f64() * 1e3;
         let stop = tuning::gpu_stop();
         let run = ops.len().min(stop);
         // Transcript readback: one reused staging buffer whose copies ride the
         // graph's last submission, so no extra queue sync is needed.
         let id_bytes = (t * 4) as u64;
         let sum_bytes = (((n_lfr * 4) as u64) + 3) & !3;
+        let t0 = std::time::Instant::now();
         let stage = tuning::rb_fused().then(|| self.gpu.stage_for(id_bytes + sum_bytes));
+        let d_sf = t0.elapsed().as_secs_f64() * 1e3;
         let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Windows TDR resets the device when one submission keeps the GPU busy
         // past ~2 s. A lost device silently turns every later dispatch into a
@@ -662,6 +668,7 @@ impl GpuEngine {
                 count: (run * 2) as u32,
             })
         });
+        let t0 = std::time::Instant::now();
         let mut i = 0usize;
         while i < run {
             let end = (i + chunk).min(run);
@@ -712,16 +719,20 @@ impl GpuEngine {
             enc.copy_buffer_to_buffer(&row_sums, 0, st, id_bytes, sum_bytes);
             self.gpu.queue.submit([enc.finish()]);
         }
+        let d_sched = t0.elapsed().as_secs_f64() * 1e3;
+        let t0 = std::time::Instant::now();
         // Single wait for the whole graph (see the batching comment above).
         self.gpu
             .device
             .poll(wgpu::PollType::wait_indefinitely())
             .context("poll graph")?;
+        let d_wait = t0.elapsed().as_secs_f64() * 1e3;
         if prof {
             self.dump_prof(&qset.unwrap(), &ops)?;
         }
         // One map serves both readbacks: the token ids and the frontend's
         // per-row CMVN sums (the `feat_sum` diagnostic).
+        let t0 = std::time::Instant::now();
         let raw = match stage.as_ref() {
             Some(st) => self.gpu.map_staged(st, id_bytes + sum_bytes)?,
             None => self
@@ -736,6 +747,8 @@ impl GpuEngine {
         if let Some(err) = pollster::block_on(guard.pop()) {
             bail!("GPU 校验失败: {err}");
         }
+        let d_rb = t0.elapsed().as_secs_f64() * 1e3;
+        let t0 = std::time::Instant::now();
         let mut frames = Vec::with_capacity(t);
         for c in id_bytes.chunks_exact(4) {
             frames.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
@@ -743,7 +756,18 @@ impl GpuEngine {
         if tuning::gpu_debug() {
             self.dump_debug(pad, t, ops.len(), &frames)?;
         }
-        Ok((greedy(&frames), feat_sum))
+        let out = greedy(&frames);
+        let d_gd = t0.elapsed().as_secs_f64() * 1e3;
+        // `SVS_CPU_PROF=1`: the timed-region CPU accounting the objective's
+        // criterion ③ refers to (upload + readback + scheduling, no math).
+        // The six `Instant::now` calls cost well under a microsecond.
+        if tuning::cpu_prof() {
+            eprintln!(
+                "cpu prof[gpu]: stage={d_sf:.2} record={d_rec:.2} upload={d_up:.2} sched={d_sched:.2} readback={d_rb:.2} decode={d_gd:.2} total={:.2} wait={d_wait:.1} (ms)",
+                d_sf + d_rec + d_up + d_sched + d_rb + d_gd
+            );
+        }
+        Ok((out, feat_sum))
     }
 }
 

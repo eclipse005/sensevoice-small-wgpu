@@ -1,0 +1,35 @@
+# 验收证据索引（objective 成功标准 ①–④）
+
+本目录的脚本可直接复现所有数字；`-N 5` = 每素材跑 5 次取中位。
+（`bench_median.ps1` / `bench_mem.ps1` / `bench_cuda_warm.py` 由 `_scratch/` 原样拷贝入仓。）
+
+## ① GPU RTFx 6/6 ≥ CUDA warm 中位
+- 脚本 `bench_median.ps1 -N 5`；CUDA 线来自 `bench_cuda_warm.py`（warmup 丢弃 + 3 次中位）。
+- 证据 `median_n5.txt`：**202.8 / 244.3 / 218.3 / 216.6 / 175.8 / 169.1**
+  vs 目标 **193.1 / 239.8 / 192.8 / 213.4 / 146.1 / 145.6** → **6/6 达标**。
+- 历轮（同协议）：5.8.7 报告 196.4/237.0/216.6/214.9/174.3/169.6（当时 30s 差 1.2%），
+  5.8.9 起 6/6。表中数字为脚本原样输出的中位；HANDOFF 里「最优」指跨轮最好，不是单次最好。
+
+## ② 峰值内存 / 显存
+- **RAM**（`peak_mem.ps1`，10 ms 采样 WorkingSet64，Refresh 修正）→ `peak_rss_6.txt`：
+  969 / 970 / 973 / 974 / 979 / 979 MiB vs CUDA 1.33–1.58 GB → **6/6 更低（低 29–40%）**。
+- **devVRAM**（`bench_mem.ps1`，nvidia-smi 逐进程采样）→ `devvram_6.txt`：
+  1093 / 1091 / 1349 / 1349 / 1631 / 1643 MiB vs CUDA 1044 / 1112 / 1438 / 1438 / 2144 / 2172
+  → **5/6 更低；15s_en 1093 vs 1044 = +4.7%（该项目前是唯一未逐字满足的条目）**。
+- 15s 缺口构成（实测核对）：f32 权重 893 MiB（CUDA 同为 f32：`torch.float32` 234.0M 参数 = 892.6 MiB）
+  + 激活 ~39 MiB + Vulkan 驱动/管线/描述符 ~160 MiB；CUDA 的 1044 = 权重 893 + 激活/工作区 ~80 + 驱动 ~70。
+  权重已打平，差异在驱动侧，无法在不降精度的前提下消除。
+
+## ③ 计时区 CPU ≤5 ms（无 frontend/编码数学）
+- 提交版插桩 `SVS_CPU_PROF=1`（`src/encoder_gpu.rs`；默认路径额外开销 < 1 µs）。
+- 证据 `cpu_prof_30s_zh.txt`（6 次）、`cpu_prof_90s_en.txt`（3 次）。
+- 结果：30s_zh total 2.13–2.69 ms（**中位 2.30**）、90s_en 2.38–2.60 ms；
+  相位 = stage 0.00 + record 0.2 + upload 0.3 + sched 1.8 + readback 0.05 + decode 0.01 ms。
+  全部为样本上传 / token 回读 / 命令调度；fbank·FFT·mel·LFR·CMVN·位置编码与全部编码器算子在 GPU。
+
+## ④ 门禁全绿
+- CPU/GPU 各 6/6 gold：`sensevoice.exe --device {cpu,P104} --check-gold gold/<w>.json`（每次改动均跑）。
+- 12/12 测试：`cargo test --release`。
+- CPU 全迹 78/78：`SVS_TRACE=1 ... --device cpu` → 与 `trace_base_90s_en.txt` 逐行比对
+  （注意 base 由 git checkout 成 CRLF，比对前先 `tr -d '\r'`）。
+- 零编译警告：`cargo build --release 2>&1 | grep -cE '^(warning|error)'` = 0。

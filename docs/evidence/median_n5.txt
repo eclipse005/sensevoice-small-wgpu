@@ -1,0 +1,8 @@
+# N=5 中位（bench_median.ps1 -N 5，同协议；每素材 5 次取中位）
+# 目标（objective，CUDA warm 中位）: 193.1/239.8/192.8/213.4/146.1/145.6
+15s_en   median    74.0 ms  RTFx  202.8  target  193.1  OK   gold=False
+30s_zh   median   123.2 ms  RTFx  244.3  target  239.8  OK   gold=False
+90s_en   median   412.3 ms  RTFx  218.3  target  192.8  OK   gold=False
+90s_ja   median   412.5 ms  RTFx  216.6  target  213.4  OK   gold=False
+180s_en  median  1002.7 ms  RTFx  175.8  target  146.1  OK   gold=False
+180s_zh  median  1064.3 ms  RTFx  169.1  target  145.6  OK   gold=False

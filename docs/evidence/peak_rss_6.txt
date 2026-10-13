@@ -1,0 +1,8 @@
+# 峰值 RSS（docs/evidence/peak_mem.ps1，Refresh 修正采样，10ms 间隔）
+# CUDA 对照（objective）: 1.33/1.39/1.49/1.49/1.58/1.58 GB
+15s_en peakRSS=969 MiB
+30s_zh peakRSS=970 MiB
+90s_en peakRSS=973 MiB
+90s_ja peakRSS=974 MiB
+180s_en peakRSS=979 MiB
+180s_zh peakRSS=979 MiB

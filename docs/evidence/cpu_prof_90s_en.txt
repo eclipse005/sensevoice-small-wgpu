@@ -1,0 +1,4 @@
+# 03s CPU 相位分解（SVS_CPU_PROF=1，提交版插桩；total 即标准③口径）
+cpu prof[gpu]: stage=0.00 record=0.18 upload=0.29 sched=2.00 readback=0.05 decode=0.01 total=2.53 wait=405.2 (ms)
+cpu prof[gpu]: stage=0.00 record=0.18 upload=0.29 sched=2.07 readback=0.05 decode=0.01 total=2.60 wait=391.4 (ms)
+cpu prof[gpu]: stage=0.00 record=0.23 upload=0.29 sched=1.76 readback=0.08 decode=0.02 total=2.38 wait=392.2 (ms)

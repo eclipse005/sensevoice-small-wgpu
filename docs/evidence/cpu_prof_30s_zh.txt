@@ -1,0 +1,6 @@
+cpu prof[gpu]: stage=0.00 record=0.20 upload=0.29 sched=1.74 readback=0.04 decode=0.01 total=2.29 wait=112.3 (ms)
+cpu prof[gpu]: stage=0.00 record=0.18 upload=0.31 sched=1.99 readback=0.04 decode=0.01 total=2.52 wait=111.9 (ms)
+cpu prof[gpu]: stage=0.00 record=0.20 upload=0.29 sched=1.78 readback=0.04 decode=0.01 total=2.32 wait=112.5 (ms)
+cpu prof[gpu]: stage=0.00 record=0.15 upload=0.30 sched=2.18 readback=0.05 decode=0.01 total=2.69 wait=112.3 (ms)
+cpu prof[gpu]: stage=0.00 record=0.17 upload=0.29 sched=1.62 readback=0.04 decode=0.01 total=2.13 wait=112.5 (ms)
+cpu prof[gpu]: stage=0.00 record=0.19 upload=0.29 sched=1.77 readback=0.05 decode=0.01 total=2.31 wait=112.4 (ms)
