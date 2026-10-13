@@ -105,6 +105,13 @@ pub fn fuse_relu() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_RELU").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_TILE_SMALL=0` routes every GEMM through the 128×128 tile (the 64×64
+/// short-clip tile is the default for `M <= 512`).
+pub fn tile_small() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("SVS_TILE_SMALL").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_FUSE_ADD=0` falls back to the separate residual `add` pass after the
 /// memory block (the fused form does the same `src + mem` in that kernel).
 pub fn fuse_add() -> bool {

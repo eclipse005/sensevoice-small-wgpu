@@ -12,8 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use crate::ctc::{greedy, VOCAB};
 use crate::frontend::Frontend;
 use crate::gemm_f32::{
-    gemm_f32, gemm_f32_bias, gemm_f32_bias_relu, gemm_f32_bias_tall, gemm_f32_narrow,
-    gemm_f32_narrow_relu, gemm_f32_tall, gemm_f32_tall_relu, GEMM_BM, GEMM_BM_TALL, GEMM_BN,
+    gemm_f32, gemm_f32_bias, gemm_f32_bias_relu, gemm_f32_small, gemm_f32_small_bias,
+    gemm_f32_small_relu, GEMM_BM, GEMM_BN, GEMM_BN_SMALL, GEMM_BM_SMALL,
 };
 use crate::gpu::Gpu;
 use crate::shaders;
@@ -144,15 +144,9 @@ enum Pid {
     GemmNtTall,
     GemmBTall,
     GemmF32cTall,
-    /// The narrow tile (BM=128, BN=64, BK=8) for the middle range of M.
-    GemmNarrow,
-    GemmNtNarrow,
-    GemmBNarrow,
-    GemmF32cNarrow,
     /// The feed-forward `w1` projection with the ReLU in the epilogue.
     GemmBRelu,
     GemmBTallRelu,
-    GemmBNarrowRelu,
     Fsmn,
     Split,
     Soft,
@@ -186,13 +180,8 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::GemmNtTall => "gemm_nt_tall",
         Pid::GemmBTall => "gemm_b_tall",
         Pid::GemmF32cTall => "gemm_f32c_tall",
-        Pid::GemmNarrow => "gemm_narrow",
-        Pid::GemmNtNarrow => "gemm_nt_narrow",
-        Pid::GemmBNarrow => "gemm_b_narrow",
-        Pid::GemmF32cNarrow => "gemm_f32c_narrow",
         Pid::GemmBRelu => "gemm_b_relu",
         Pid::GemmBTallRelu => "gemm_b_tall_relu",
-        Pid::GemmBNarrowRelu => "gemm_b_narrow_relu",
         Pid::Fsmn => "fsmn",
         Pid::Split => "split",
         Pid::Soft => "soft",
@@ -346,13 +335,8 @@ struct Pipes {
     gemm_nt_tall: wgpu::ComputePipeline,
     gemm_b_tall: wgpu::ComputePipeline,
     gemm_f32c_tall: wgpu::ComputePipeline,
-    gemm_narrow: wgpu::ComputePipeline,
-    gemm_nt_narrow: wgpu::ComputePipeline,
-    gemm_b_narrow: wgpu::ComputePipeline,
-    gemm_f32c_narrow: wgpu::ComputePipeline,
     gemm_b_relu: wgpu::ComputePipeline,
     gemm_b_tall_relu: wgpu::ComputePipeline,
-    gemm_b_narrow_relu: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
@@ -1230,12 +1214,12 @@ fn push_gemm(
     // Short audio leaves a 128-row tile with a grid too small to fill 15 SMs
     // (at pad = 512 an outp dispatch is 16 blocks).  The tall tile halves the
     // rows per workgroup, doubling the m axis; it is the same arithmetic.
-    // Tile choice by M, all measured with paired A/B on this card:
-    //   M <= 256  the tall tile (64x128, BK=16) wins by ~5% on 15s_en;
-    //   256 < M <= 512  the narrow tile (128x64, BK=8) wins by ~1% on 30s_zh;
-    //   larger M  the 128x128/BK=8 default, where the deeper slab and the
-    //   extra blocks stop paying.
-    let (pipe, bm, bn) = if m <= 256 {
+    // Tile choice by M, measured with paired A/B on this card: short clips
+    // (M <= 512) get the 64x64 tile, which quadruples the block count and
+    // fills the card (15s_en 82-84 ms -> 75-79); longer sequences keep the
+    // 128x128 tile where per-block efficiency and shared-memory reuse win.
+    // `SVS_TILE_SMALL=0` routes everything through the 128x128 tile.
+    let (pipe, bm, bn) = if tuning::tile_small() && m <= 512 {
         (
             match pipe {
                 Pid::Gemm => Pid::GemmTall,
@@ -1245,21 +1229,8 @@ fn push_gemm(
                 Pid::GemmF32c => Pid::GemmF32cTall,
                 other => other,
             },
-            GEMM_BM_TALL,
-            GEMM_BN,
-        )
-    } else if m <= 512 {
-        (
-            match pipe {
-                Pid::Gemm => Pid::GemmNarrow,
-                Pid::GemmNt => Pid::GemmNtNarrow,
-                Pid::GemmB => Pid::GemmBNarrow,
-                Pid::GemmBRelu => Pid::GemmBNarrowRelu,
-                Pid::GemmF32c => Pid::GemmF32cNarrow,
-                other => other,
-            },
-            128,
-            64,
+            GEMM_BM_SMALL,
+            GEMM_BN_SMALL,
         )
     } else {
         (pipe, GEMM_BM, GEMM_BN)
@@ -1569,17 +1540,12 @@ impl Pipes {
             gemm_nt: gpu.pipeline("gemm-nt", &gemm_f32(true, false, false), "gemm", &gemm_pl)?,
             gemm_b: gpu.pipeline("gemm-b", &gemm_f32_bias(false), "gemm", &gemm_b_pl)?,
             gemm_f32c: gpu.pipeline("gemm-f32c", &gemm_f32_bias(true), "gemm", &gemm_b_pl)?,
-            gemm_tall: gpu.pipeline("gemm-tall", &gemm_f32_tall(false, false, false), "gemm", &gemm_pl)?,
-            gemm_nt_tall: gpu.pipeline("gemm-nt-tall", &gemm_f32_tall(true, false, false), "gemm", &gemm_pl)?,
-            gemm_b_tall: gpu.pipeline("gemm-b-tall", &gemm_f32_bias_tall(false), "gemm", &gemm_b_pl)?,
-            gemm_f32c_tall: gpu.pipeline("gemm-f32c-tall", &gemm_f32_bias_tall(true), "gemm", &gemm_b_pl)?,
-            gemm_narrow: gpu.pipeline("gemm-narrow", &gemm_f32_narrow(false, false, false), "gemm", &gemm_pl)?,
-            gemm_nt_narrow: gpu.pipeline("gemm-nt-narrow", &gemm_f32_narrow(true, false, false), "gemm", &gemm_pl)?,
-            gemm_b_narrow: gpu.pipeline("gemm-b-narrow", &gemm_f32_narrow(false, false, true), "gemm", &gemm_b_pl)?,
-            gemm_f32c_narrow: gpu.pipeline("gemm-f32c-narrow", &gemm_f32_narrow(false, true, true), "gemm", &gemm_b_pl)?,
+            gemm_tall: gpu.pipeline("gemm-small", &gemm_f32_small(false, false, false), "gemm", &gemm_pl)?,
+            gemm_nt_tall: gpu.pipeline("gemm-nt-small", &gemm_f32_small(true, false, false), "gemm", &gemm_pl)?,
+            gemm_b_tall: gpu.pipeline("gemm-b-small", &gemm_f32_small_bias(false), "gemm", &gemm_b_pl)?,
+            gemm_f32c_tall: gpu.pipeline("gemm-f32c-small", &gemm_f32_small_bias(true), "gemm", &gemm_b_pl)?,
             gemm_b_relu: gpu.pipeline("gemm-b-relu", &gemm_f32_bias_relu(), "gemm", &gemm_b_pl)?,
-            gemm_b_tall_relu: gpu.pipeline("gemm-b-tall-relu", &gemm_f32_tall_relu(), "gemm", &gemm_b_pl)?,
-            gemm_b_narrow_relu: gpu.pipeline("gemm-b-narrow-relu", &gemm_f32_narrow_relu(), "gemm", &gemm_b_pl)?,
+            gemm_b_tall_relu: gpu.pipeline("gemm-b-small-relu", &gemm_f32_small_relu(), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
@@ -1619,13 +1585,8 @@ impl Pipes {
             Pid::GemmNtTall => &self.gemm_nt_tall,
             Pid::GemmBTall => &self.gemm_b_tall,
             Pid::GemmF32cTall => &self.gemm_f32c_tall,
-            Pid::GemmNarrow => &self.gemm_narrow,
-            Pid::GemmNtNarrow => &self.gemm_nt_narrow,
-            Pid::GemmBNarrow => &self.gemm_b_narrow,
-            Pid::GemmF32cNarrow => &self.gemm_f32c_narrow,
             Pid::GemmBRelu => &self.gemm_b_relu,
             Pid::GemmBTallRelu => &self.gemm_b_tall_relu,
-            Pid::GemmBNarrowRelu => &self.gemm_b_narrow_relu,
             Pid::Fsmn => &self.fsmn,
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,

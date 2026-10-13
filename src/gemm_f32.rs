@@ -51,8 +51,9 @@ pub const GEMM_TY: usize = 16;
 /// neighbouring tiles and silently corrupts the result.
 pub const GEMM_BM: u32 = (GEMM_TY * GEMM_TM) as u32;
 pub const GEMM_BN: u32 = (GEMM_TX * GEMM_TN) as u32;
-/// Rows of the tall (small-M) tile: `gemm_f32_tall` halves `TY`.
-pub const GEMM_BM_TALL: u32 = (8 * GEMM_TM) as u32;
+/// Rows/cols of the small-M tile (`gemm_f32_small`): both `TY` and `TX` are 8.
+pub const GEMM_BM_SMALL: u32 = (8 * GEMM_TM) as u32;
+pub const GEMM_BN_SMALL: u32 = (8 * GEMM_TN) as u32;
 
 /// Four `vec4` chunk loads per unrolled k step.
 const UNROLL_Q: usize = 4;
@@ -63,28 +64,12 @@ const UNROLL_Q: usize = 4;
 /// the conservative number for the device-limit check in `gpu.rs`.
 pub const GEMM_SMEM: u32 = {
     let normal = 2 * (GEMM_BM as usize + GEMM_BN as usize) * GEMM_BK / 4 * 16;
-    let tall = 2 * (GEMM_BM_TALL as usize + GEMM_BN as usize) * 16 / 4 * 16;
+    let tall = 2 * (GEMM_BM_SMALL as usize + GEMM_BN_SMALL as usize) * 16 / 4 * 16;
     if normal > tall { normal as u32 } else { tall as u32 }
 };
 
 pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
     gemm_f32_tiled(transb, beta, bias, GEMM_TX, GEMM_TY, GEMM_BK, false)
-}
-
-/// The small-M tile: same micro-tile, half the rows per workgroup and a deeper
-/// k slab (BK=16), which halves the barrier count.  Measured on 30s_zh: the
-/// 128-row/BK=8 tile gives 156 ms, the tall BK=16 one 145 ms; on 90s_en the
-/// roles flip (454 vs 484 ms) because the deeper slab costs a block of
-/// occupancy, so the encoder picks per dispatch.
-pub fn gemm_f32_tall(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, GEMM_TX, 8, 16, false)
-}
-
-/// The narrow tile (BN=64, BK=8): same micro-tile and block size, half the
-/// columns.  Doubles the block count of the n-limited shapes (`N = 512`
-/// projections), which is what the short-clip dispatches starve on.
-pub fn gemm_f32_narrow(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, 8, 16, 8, false)
 }
 
 fn gemm_f32_tiled(
@@ -369,19 +354,6 @@ pub fn gemm_f32_bias(beta: bool) -> String {
     gemm_f32(false, beta, true)
 }
 
-pub fn gemm_f32_bias_tall(beta: bool) -> String {
-    gemm_f32_tall(false, beta, true)
-}
-
-#[cfg(test)]
-mod dump_tests {
-    #[test]
-    fn dump_narrow() {
-        std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_narrow.wgsl", super::gemm_f32_narrow(false, false, false)).unwrap();
-        std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_tall.wgsl", super::gemm_f32_tall(false, false, false)).unwrap();
-    }
-}
-
 /// [`gemm_f32_bias`] with the ReLU folded into the epilogue: `max(acc + bias, 0)`
 /// is stored directly, so the feed-forward output needs no separate pass. Same
 /// values as bias-then-relu on every element.
@@ -389,10 +361,19 @@ pub fn gemm_f32_bias_relu() -> String {
     gemm_f32_tiled(false, false, true, GEMM_TX, GEMM_TY, GEMM_BK, true)
 }
 
-pub fn gemm_f32_tall_relu() -> String {
-    gemm_f32_tiled(false, false, true, GEMM_TX, 8, 16, true)
+/// The small-M tile: 64×64 per workgroup with 64 threads (8×8 micro-tile), so
+/// a short clip's dispatches get four times the blocks of the 128×128 tile
+/// (an `outp` at `M=256` goes from 8 to 32) without changing any arithmetic.
+/// Measured on 15s_en: the 128-row tile 82-84 ms, this one 75-79; on 30s_zh the
+/// same. `SVS_TILE_SMALL=0` routes everything through the 128×128 tile again.
+pub fn gemm_f32_small(transb: bool, beta: bool, bias: bool) -> String {
+    gemm_f32_tiled(transb, beta, bias, 8, 8, 8, false)
 }
 
-pub fn gemm_f32_narrow_relu() -> String {
-    gemm_f32_tiled(false, false, true, 8, 16, 8, true)
+pub fn gemm_f32_small_bias(beta: bool) -> String {
+    gemm_f32_tiled(false, beta, true, 8, 8, 8, false)
+}
+
+pub fn gemm_f32_small_relu() -> String {
+    gemm_f32_tiled(false, false, true, 8, 8, 8, true)
 }
