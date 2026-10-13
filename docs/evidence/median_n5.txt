@@ -14,3 +14,11 @@
 90s_ja   median   412.7 ms  RTFx  216.5  target  213.4  OK   gold=False
 180s_en  median  1003.9 ms  RTFx  175.6  target  146.1  OK   gold=False
 180s_zh  median  1064.7 ms  RTFx  169.1  target  145.6  OK   gold=False
+
+# ── 复测（提交 f7d768c，SVS_FUSE_ADD 修复后；该修复只改非默认路径绑定）──
+15s_en   median    73.3 ms  RTFx  204.8  target  193.1  OK   gold=False
+30s_zh   median   123.2 ms  RTFx  244.2  target  239.8  OK   gold=False
+90s_en   median   412.6 ms  RTFx  218.1  target  192.8  OK   gold=False
+90s_ja   median   412.7 ms  RTFx  216.4  target  213.4  OK   gold=False
+180s_en  median  1005.7 ms  RTFx  175.3  target  146.1  OK   gold=False
+180s_zh  median  1070.7 ms  RTFx  168.1  target  145.6  OK   gold=False
