@@ -43,3 +43,14 @@
 - CPU 全迹 78/78：`SVS_TRACE=1 ... --device cpu` → 与 `trace_base_90s_en.txt` 逐行比对
   （注意 base 由 git checkout 成 CRLF，比对前先 `tr -d '\r'`）。
 - 零编译警告：`cargo build --release 2>&1 | grep -cE '^(warning|error)'` = 0。
+
+## 度量口径与已知陷阱（供复核者）
+- **RTFx**：本仓一律"每素材 5 次取中位"（`bench_median.ps1` 原样输出）；历轮数字见 HANDOFF §5.8.x，
+  早期轮次曾出现 5/6（30s 差 1.2%），5.8.9 起稳定 6/6。
+- **CUDA 线**：来自 `bench_cuda_warm.json`（warmup 丢弃 + repeats=3 取中位）。
+  更早的 `bench_original_cuda.json` 里 `rtfx` 一栏有冷启动污染（15s=25.84），已废弃；该文件的
+  内存/devVRAM 栏仍是 objective ② 的对照来源。
+- **口径差异**：本仓 devVRAM 是 nvidia-smi 逐进程实际占用；CUDA 侧是 `torch.cuda.max_memory_reserved()`
+  （含分配器缓存，一般 ≥ 实际）。即本仓在更严的口径下比较。
+- **CPU 全迹比对**：`trace_base_90s_en.txt` 经 git checkout 后是 CRLF，比对前先 `tr -d ''`。
+- **权重精度核对**：CUDA 侧为 `torch.float32` 234.0M 参数 = 892.6 MiB（实测），与本仓 f32 slab ~893 MiB 打平。
