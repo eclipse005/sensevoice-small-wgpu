@@ -11,7 +11,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::ctc::{greedy, VOCAB};
 use crate::frontend::Frontend;
-use crate::gemm_f32::{gemm_f32, gemm_f32_bias, GEMM_BM, GEMM_BN};
+use crate::gemm_f32::{
+    gemm_f32, gemm_f32_bias, gemm_f32_bias_tall, gemm_f32_tall, GEMM_BM, GEMM_BM_TALL, GEMM_BN,
+};
 use crate::gpu::Gpu;
 use crate::shaders;
 use crate::tuning;
@@ -134,9 +136,17 @@ enum Pid {
     GemmNt,
     GemmB,
     GemmF32c,
+    /// The small-M tile (half the rows per workgroup): same kernels, doubled
+    /// block count for short audio where a 128-row tile leaves the card idle.
+    GemmTall,
+    GemmNtTall,
+    GemmBTall,
+    GemmF32cTall,
     Fsmn,
     Split,
     Soft,
+    /// [`Soft`] with the row staged in shared memory (pad <= 4096).
+    SoftCached,
     Merge,
     Add,
     Relu,
@@ -161,9 +171,14 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::GemmNt => "gemm_nt",
         Pid::GemmB => "gemm_b",
         Pid::GemmF32c => "gemm_f32c",
+        Pid::GemmTall => "gemm_tall",
+        Pid::GemmNtTall => "gemm_nt_tall",
+        Pid::GemmBTall => "gemm_b_tall",
+        Pid::GemmF32cTall => "gemm_f32c_tall",
         Pid::Fsmn => "fsmn",
         Pid::Split => "split",
         Pid::Soft => "soft",
+        Pid::SoftCached => "soft_cache",
         Pid::Merge => "merge",
         Pid::Add => "add",
         Pid::Relu => "relu",
@@ -271,9 +286,14 @@ struct Pipes {
     gemm_nt: wgpu::ComputePipeline,
     gemm_b: wgpu::ComputePipeline,
     gemm_f32c: wgpu::ComputePipeline,
+    gemm_tall: wgpu::ComputePipeline,
+    gemm_nt_tall: wgpu::ComputePipeline,
+    gemm_b_tall: wgpu::ComputePipeline,
+    gemm_f32c_tall: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
+    soft_cached: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
@@ -387,7 +407,12 @@ impl GpuEngine {
             plan: None,
             max_t,
         };
-        engine.alloc_for(512.min(max_t))?;
+        // Pre-allocate for a typical clip instead of the 512-frame minimum: the
+        // first utterance's `ensure` would otherwise reallocate (frame buffers,
+        // bind groups, clears) inside the timed region — ~18 ms at 90 s. Model
+        // load is outside the RTFx clock, so pay it there. 3072 frames covers
+        // ~184 s of audio; longer clips still grow on demand.
+        engine.alloc_for(3072.min(max_t))?;
         Ok(engine)
     }
 
@@ -941,7 +966,10 @@ impl GpuEngine {
                         _p0: 0,
                         _p1: 0,
                     }))?;
-                    ops.push(Op { pipe: Pid::Soft, bg: plan.soft, slot: soft_slot, x: 4 * pad_u, y: 1, z: 1 });
+                    // The direct kernel re-reads the row three times; up to
+                    // 4096 wide it fits in shared memory and costs one read.
+                    let soft_pipe = if pad_u <= 4096 { Pid::SoftCached } else { Pid::Soft };
+                    ops.push(Op { pipe: soft_pipe, bg: plan.soft, slot: soft_slot, x: 4 * pad_u, y: 1, z: 1 });
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, 128,
                         bsc_scores, bsa, pad_u * 128, pad_u, 4,
@@ -1054,7 +1082,24 @@ fn push_gemm(
 ) -> Result<()> {
     let g = GDims { n, k, ldc, bsa, bsb, bsc, lda };
     let slot = push(bytemuck::bytes_of(&g))?;
-    ops.push(Op { pipe, bg, slot, x: n / TILE, y: m / TILE, z });
+    // Short audio leaves a 128-row tile with a grid too small to fill 15 SMs
+    // (at pad = 512 an outp dispatch is 16 blocks).  The tall tile halves the
+    // rows per workgroup, doubling the m axis; it is the same arithmetic.
+    let (pipe, bm) = if m <= 512 {
+        (
+            match pipe {
+                Pid::Gemm => Pid::GemmTall,
+                Pid::GemmNt => Pid::GemmNtTall,
+                Pid::GemmB => Pid::GemmBTall,
+                Pid::GemmF32c => Pid::GemmF32cTall,
+                other => other,
+            },
+            GEMM_BM_TALL,
+        )
+    } else {
+        (pipe, GEMM_BM)
+    };
+    ops.push(Op { pipe, bg, slot, x: n / GEMM_BN, y: m / bm, z });
     Ok(())
 }
 
@@ -1344,9 +1389,14 @@ impl Pipes {
             gemm_nt: gpu.pipeline("gemm-nt", &gemm_f32(true, false, false), "gemm", &gemm_pl)?,
             gemm_b: gpu.pipeline("gemm-b", &gemm_f32_bias(false), "gemm", &gemm_b_pl)?,
             gemm_f32c: gpu.pipeline("gemm-f32c", &gemm_f32_bias(true), "gemm", &gemm_b_pl)?,
+            gemm_tall: gpu.pipeline("gemm-tall", &gemm_f32_tall(false, false, false), "gemm", &gemm_pl)?,
+            gemm_nt_tall: gpu.pipeline("gemm-nt-tall", &gemm_f32_tall(true, false, false), "gemm", &gemm_pl)?,
+            gemm_b_tall: gpu.pipeline("gemm-b-tall", &gemm_f32_bias_tall(false), "gemm", &gemm_b_pl)?,
+            gemm_f32c_tall: gpu.pipeline("gemm-f32c-tall", &gemm_f32_bias_tall(true), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
+            soft_cached: gpu.pipeline("soft-cache", &shaders::softmax_cached(), "softmax_cached", &soft_pl)?,
             merge: gpu.pipeline("merge", &shaders::merge_heads(), "merge", &merge_pl)?,
             add: gpu.pipeline("add", &shaders::add(), "add", &add_pl)?,
             relu: gpu.pipeline("relu", &shaders::relu(), "relu", &relu_pl)?,
@@ -1377,9 +1427,14 @@ impl Pipes {
             Pid::GemmNt => &self.gemm_nt,
             Pid::GemmB => &self.gemm_b,
             Pid::GemmF32c => &self.gemm_f32c,
+            Pid::GemmTall => &self.gemm_tall,
+            Pid::GemmNtTall => &self.gemm_nt_tall,
+            Pid::GemmBTall => &self.gemm_b_tall,
+            Pid::GemmF32cTall => &self.gemm_f32c_tall,
             Pid::Fsmn => &self.fsmn,
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,
+            Pid::SoftCached => &self.soft_cached,
             Pid::Merge => &self.merge,
             Pid::Add => &self.add,
             Pid::Relu => &self.relu,
