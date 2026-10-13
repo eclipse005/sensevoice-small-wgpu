@@ -22,3 +22,11 @@
 90s_ja   median   412.7 ms  RTFx  216.4  target  213.4  OK   gold=False
 180s_en  median  1005.7 ms  RTFx  175.3  target  146.1  OK   gold=False
 180s_zh  median  1070.7 ms  RTFx  168.1  target  145.6  OK   gold=False
+
+# ── 完成审核前最终复测（提交 16b34a1，② 修订后）──
+15s_en   median    73.7 ms  RTFx  203.5  target  193.1  OK   gold=False
+30s_zh   median   122.6 ms  RTFx  245.3  target  239.8  OK   gold=False
+90s_en   median   412.2 ms  RTFx  218.3  target  192.8  OK   gold=False
+90s_ja   median   412.5 ms  RTFx  216.5  target  213.4  OK   gold=False
+180s_en  median  1004.5 ms  RTFx  175.5  target  146.1  OK   gold=False
+180s_zh  median  1064.2 ms  RTFx  169.1  target  145.6  OK   gold=False
