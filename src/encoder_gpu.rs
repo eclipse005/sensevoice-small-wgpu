@@ -1248,7 +1248,11 @@ fn push_gemm(
     // 90s_ja 408-411 ms). The shapes that are large on both axes keep the
     // 128x128 tile where per-block efficiency and shared-memory reuse win.
     // `SVS_TILE_SMALL=0` routes everything through the 128x128 tile.
-    let (pipe, bm, bn) = if tuning::tile_small() && (m <= 512 || n <= 512) {
+    // Output projections (N=512, short K) re-read A 8x and W 4x under the 64x64
+// tile; the 128x128 tile halves that and still has enough blocks (the model's
+// N is 512 on every fixture, M is 256..3000).
+    let wide_short_k = tuning::tile_wide() && n == 512 && k <= 512;
+    let (pipe, bm, bn) = if tuning::tile_small() && (m <= 512 || n <= 512) && !wide_short_k {
         (
             match pipe {
                 Pid::Gemm => Pid::GemmTall,

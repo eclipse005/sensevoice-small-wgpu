@@ -112,6 +112,13 @@ pub fn fuse_merge() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_MERGE").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_TILE_WIDE=0` puts the N=512/short-K projections back on the 64x64
+/// tile (they otherwise use the 128x128 one, which halves their A/W re-reads).
+pub fn tile_wide() -> bool {
+    static W: OnceLock<bool> = OnceLock::new();
+    *W.get_or_init(|| std::env::var("SVS_TILE_WIDE").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_FSMN_TAP=0` uses the checkpoint's `[512][11]` weight layout instead of
 /// the host-transposed tap-major copy.
 pub fn fsmn_tap() -> bool {
