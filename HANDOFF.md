@@ -593,6 +593,8 @@ N≤512 的形状（outp/w2 投影、N=128 的 av）在任何长度下都受益�
 | **split 只写 Q，K/V 直接读 qkv 列 slab**（GDims 新增 `ldw` + 绑定窗口） | 90s_ja 214.7、30s 242.6；split 分相 4.9→0.5ms | `SVS_FUSE_SPLIT=0` |
 | **fsmn 权重转置 tap-major**（[512][11]→[11][512]，gather 变合并） | 15s 193.3、90s_ja 214.7 | `SVS_FSMN_TAP=0` |
 | 证伪：small tile BK=16（30s 135 vs 124） | | |
+| **N=512 短 K（outp）改用 128×128 tile**：64×64 会把 A 重读 8×/W 重读 4×，128×128 减半 | 15s 单次 73.5ms（197 RTFx）、90s 401ms | `SVS_TILE_WIDE=0` |
+| 证伪：UNROLL_Q=4→8（15s 90.4、90s 460） | | |
 
 ### 5.8.10 第六轮（下半）：LN 预取展开
 
