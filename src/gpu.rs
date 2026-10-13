@@ -330,9 +330,15 @@ impl Gpu {
     }
 
     pub fn upload_chunked(&self, buf: &wgpu::Buffer, data: &[u8]) -> Result<()> {
+        self.upload_chunked_at(buf, 0, data)
+    }
+
+    /// [`Self::upload_chunked`] into a byte offset of a larger buffer (the
+    /// weight slab).
+    pub fn upload_chunked_at(&self, buf: &wgpu::Buffer, at: u64, data: &[u8]) -> Result<()> {
         const CHUNK: usize = 8 << 20;
         for (i, piece) in data.chunks(CHUNK).enumerate() {
-            self.queue.write_buffer(buf, (i * CHUNK) as u64, piece);
+            self.queue.write_buffer(buf, at + (i * CHUNK) as u64, piece);
             let pending = self.pending.get() + piece.len();
             if pending >= CHUNK {
                 // Poll, not just submit: `write_buffer` stages host memory and

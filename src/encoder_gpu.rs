@@ -218,20 +218,58 @@ struct LfrCfg {
     _p2: u32,
 }
 
+/// A tensor inside the shared weight slab: the slab is one device buffer, so
+/// each tensor is an offset/size pair rather than its own allocation. ~900
+/// small buffers cost the driver a few hundred MiB of its own bookkeeping on
+/// this machine; one allocation does not.
+#[derive(Clone)]
+struct Part {
+    buf: wgpu::Buffer,
+    offset: u64,
+    size: u64,
+}
+
+/// Bind-group entry source: a whole standalone buffer or a slab range.
+enum Res<'a> {
+    Whole(&'a wgpu::Buffer),
+    Part(&'a Part),
+}
+
+/// Append-only writer for the weight slab.
+struct Slab {
+    buf: wgpu::Buffer,
+    next: u64,
+}
+
+impl Slab {
+    fn new(gpu: &Gpu, bytes: u64) -> Self {
+        Self { buf: gpu.storage("weights", bytes), next: 0 }
+    }
+
+    fn put(&mut self, gpu: &Gpu, data: &[f32]) -> Result<Part> {
+        let size = (data.len() * 4) as u64;
+        let offset = (self.next + 255) & !255;
+        let part = Part { buf: self.buf.clone(), offset, size };
+        gpu.upload_chunked_at(&self.buf, offset, bytemuck::cast_slice(data))?;
+        self.next = offset + size;
+        Ok(part)
+    }
+}
+
 struct LayerGpu {
-    n1w: wgpu::Buffer,
-    n1b: wgpu::Buffer,
-    qkv: wgpu::Buffer,
-    qkv_b: wgpu::Buffer,
-    fsmn: wgpu::Buffer,
-    outw: wgpu::Buffer,
-    outb: wgpu::Buffer,
-    n2w: wgpu::Buffer,
-    n2b: wgpu::Buffer,
-    w1: wgpu::Buffer,
-    w1b: wgpu::Buffer,
-    w2: wgpu::Buffer,
-    w2b: wgpu::Buffer,
+    n1w: Part,
+    n1b: Part,
+    qkv: Part,
+    qkv_b: Part,
+    fsmn: Part,
+    outw: Part,
+    outb: Part,
+    n2w: Part,
+    n2b: Part,
+    w1: Part,
+    w1b: Part,
+    w2: Part,
+    w2b: Part,
     in_dim: u32,
 }
 
@@ -332,12 +370,12 @@ pub struct GpuEngine {
     gpu: Gpu,
     pipes: Pipes,
     layers: Vec<LayerGpu>,
-    after_w: wgpu::Buffer,
-    after_b: wgpu::Buffer,
-    tp_w: wgpu::Buffer,
-    tp_b: wgpu::Buffer,
-    ctc_w: wgpu::Buffer,
-    ctc_b: wgpu::Buffer,
+    after_w: Part,
+    after_b: Part,
+    tp_w: Part,
+    tp_b: Part,
+    ctc_w: Part,
+    ctc_b: Part,
     // Frontend tables (constant across utterances) and their small uniforms.
     win_tab: wgpu::Buffer,
     mel_tab: wgpu::Buffer,
@@ -419,22 +457,24 @@ impl GpuEngine {
         let pipes = Pipes::new(&gpu)?;
         mem_probe("after Pipes::new");
         eprintln!("sensevoice: 上传权重");
+        let mut slab = Slab::new(&gpu, weights_bytes(weights));
         let mut layers = Vec::with_capacity(weights.layers.len() + weights.tp.len());
         for layer in weights.layers.iter_mut().chain(weights.tp.iter_mut()) {
-            layers.push(upload_layer(&gpu, layer)?);
+            layers.push(upload_layer(&gpu, &mut slab, layer)?);
         }
-        let after_w = up_f32(&gpu, &std::mem::take(&mut weights.after_w))?;
-        let after_b = up_f32(&gpu, &std::mem::take(&mut weights.after_b))?;
-        let tp_w = up_f32(&gpu, &std::mem::take(&mut weights.tp_w))?;
-        let tp_b = up_f32(&gpu, &std::mem::take(&mut weights.tp_b))?;
-        let ctc_w = up_mat(
+        let after_w = slab.put(&gpu, &std::mem::take(&mut weights.after_w))?;
+        let after_b = slab.put(&gpu, &std::mem::take(&mut weights.after_b))?;
+        let tp_w = slab.put(&gpu, &std::mem::take(&mut weights.tp_w))?;
+        let tp_b = slab.put(&gpu, &std::mem::take(&mut weights.tp_b))?;
+        let ctc_w = slab_put_mat(
+            &mut slab,
             &gpu,
             &std::mem::take(&mut weights.ctc.w),
             weights.ctc.rows,
             weights.ctc.cols,
             CTC_PAD,
         )?;
-        let ctc_b = up_bias(&gpu, &std::mem::take(&mut weights.ctc.b), CTC_PAD)?;
+        let ctc_b = slab_put_bias(&mut slab, &gpu, &std::mem::take(&mut weights.ctc.b), CTC_PAD)?;
         // Frontend tables: the same window/mel/CMVN the CPU path uses, plus
         // the position-encoding inverse table (`add_posenc`'s `inv`, computed
         // with the same formula so the kernels stay table-driven).
@@ -1277,24 +1317,24 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
     let split = push(bind(
         dev, &pipes.split_l, "split",
         &[
-            (0, &acts.qkv),
-            (1, &acts.q),
-            (2, &acts.k),
-            (3, &acts.v),
+            (0, Res::Whole(&acts.qkv)),
+            (1, Res::Whole(&acts.q)),
+            (2, Res::Whole(&acts.k)),
+            (3, Res::Whole(&acts.v)),
         ],
         4,
         &engine.uni,
     ));
-    let qk = push(bind(dev, &pipes.gemm_l, "qk", &[(0, &acts.q), (1, &acts.k), (2, &acts.scores)], 3, &engine.uni));
-    let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, &acts.scores)], 1, &engine.uni));
+    let qk = push(bind(dev, &pipes.gemm_l, "qk", &[(0, Res::Whole(&acts.q)), (1, Res::Whole(&acts.k)), (2, Res::Whole(&acts.scores))], 3, &engine.uni));
+    let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, Res::Whole(&acts.scores))], 1, &engine.uni));
     let av = push(bind(
         dev, &pipes.gemm_l, "av",
-        &[(0, &acts.scores), (1, &acts.v), (2, &acts.av)],
+        &[(0, Res::Whole(&acts.scores)), (1, Res::Whole(&acts.v)), (2, Res::Whole(&acts.av))],
         3,
         &engine.uni,
     ));
-    let merge = push(bind(dev, &pipes.merge_l, "merge", &[(0, &acts.av), (1, &acts.ctx)], 2, &engine.uni));
-    let relu = push(bind(dev, &pipes.relu_l, "relu", &[(0, &acts.ffn)], 1, &engine.uni));
+    let merge = push(bind(dev, &pipes.merge_l, "merge", &[(0, Res::Whole(&acts.av)), (1, Res::Whole(&acts.ctx))], 2, &engine.uni));
+    let relu = push(bind(dev, &pipes.relu_l, "relu", &[(0, Res::Whole(&acts.ffn))], 1, &engine.uni));
 
     let mut items = Vec::new();
     let mut src = Hid::In;
@@ -1308,54 +1348,54 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
         let dst_buf = acts.hid(dst);
         let ln1 = push(bind(
             dev, &pipes.ln_l, "ln1",
-            &[(0, src_buf), (1, &layer.n1w), (2, &layer.n1b), (4, &acts.norm)],
+            &[(0, Res::Whole(src_buf)), (1, Res::Part(&layer.n1w)), (2, Res::Part(&layer.n1b)), (4, Res::Whole(&acts.norm))],
             3,
             &engine.uni,
         ));
         let qkv = push(bind(
             dev, &pipes.gemm_b_l, "qkv",
             &[
-                (0, &acts.norm),
-                (1, &layer.qkv),
-                (2, &acts.qkv),
-                (4, &layer.qkv_b),
+                (0, Res::Whole(&acts.norm)),
+                (1, Res::Part(&layer.qkv)),
+                (2, Res::Whole(&acts.qkv)),
+                (4, Res::Part(&layer.qkv_b)),
             ],
             3,
             &engine.uni,
         ));
         let fsmn = push(bind(
             dev, &pipes.fsmn_l, "fsmn",
-            &[(0, &acts.qkv), (1, &layer.fsmn), (3, &acts.fsmn)],
+            &[(0, Res::Whole(&acts.qkv)), (1, Res::Part(&layer.fsmn)), (3, Res::Whole(&acts.fsmn))],
             2,
             &engine.uni,
         ));
         let add = push(bind(
             dev, &pipes.add_l, "add",
-            &[(0, src_buf), (1, &acts.fsmn), (2, dst_buf)],
+            &[(0, Res::Whole(src_buf)), (1, Res::Whole(&acts.fsmn)), (2, Res::Whole(dst_buf))],
             3,
             &engine.uni,
         ));
         let outp = push(bind(
             dev, &pipes.gemm_b_l, "out",
-            &[(0, &acts.ctx), (1, &layer.outw), (2, dst_buf), (4, &layer.outb)],
+            &[(0, Res::Whole(&acts.ctx)), (1, Res::Part(&layer.outw)), (2, Res::Whole(dst_buf)), (4, Res::Part(&layer.outb))],
             3,
             &engine.uni,
         ));
         let ln2 = push(bind(
             dev, &pipes.ln_l, "ln2",
-            &[(0, dst_buf), (1, &layer.n2w), (2, &layer.n2b), (4, &acts.norm)],
+            &[(0, Res::Whole(dst_buf)), (1, Res::Part(&layer.n2w)), (2, Res::Part(&layer.n2b)), (4, Res::Whole(&acts.norm))],
             3,
             &engine.uni,
         ));
         let w1 = push(bind(
             dev, &pipes.gemm_b_l, "w1",
-            &[(0, &acts.norm), (1, &layer.w1), (2, &acts.ffn), (4, &layer.w1b)],
+            &[(0, Res::Whole(&acts.norm)), (1, Res::Part(&layer.w1)), (2, Res::Whole(&acts.ffn)), (4, Res::Part(&layer.w1b))],
             3,
             &engine.uni,
         ));
         let w2 = push(bind(
             dev, &pipes.gemm_b_l, "w2",
-            &[(0, &acts.ffn), (1, &layer.w2), (2, dst_buf), (4, &layer.w2b)],
+            &[(0, Res::Whole(&acts.ffn)), (1, Res::Part(&layer.w2)), (2, Res::Whole(dst_buf)), (4, Res::Part(&layer.w2b))],
             3,
             &engine.uni,
         ));
@@ -1374,10 +1414,10 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
             let bg = push(bind(
                 dev, &pipes.ln_l, "after",
                 &[
-                    (0, acts.hid(src)),
-                    (1, &engine.after_w),
-                    (2, &engine.after_b),
-                    (4, acts.hid(dst_h)),
+                    (0, Res::Whole(acts.hid(src))),
+                    (1, Res::Part(&engine.after_w)),
+                    (2, Res::Part(&engine.after_b)),
+                    (4, Res::Whole(acts.hid(dst_h))),
                 ],
                 3,
                 &engine.uni,
@@ -1389,10 +1429,10 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
     let bg = push(bind(
         dev, &pipes.ln_l, "tp",
         &[
-            (0, acts.hid(src)),
-            (1, &engine.tp_w),
-            (2, &engine.tp_b),
-            (4, &acts.norm),
+            (0, Res::Whole(acts.hid(src))),
+            (1, Res::Part(&engine.tp_w)),
+            (2, Res::Part(&engine.tp_b)),
+            (4, Res::Whole(&acts.norm)),
         ],
         3,
         &engine.uni,
@@ -1401,17 +1441,17 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
     let ctc = push(bind(
         dev, &pipes.gemm_b_l, "ctc",
         &[
-            (0, &acts.norm),
-            (1, &engine.ctc_w),
-            (2, &acts.logits),
-            (4, &engine.ctc_b),
+            (0, Res::Whole(&acts.norm)),
+            (1, Res::Part(&engine.ctc_w)),
+            (2, Res::Whole(&acts.logits)),
+            (4, Res::Part(&engine.ctc_b)),
         ],
         3,
         &engine.uni,
     ));
     let arg = push(bind(
         dev, &pipes.arg_l, "arg",
-        &[(0, &acts.logits), (2, &acts.ids)],
+        &[(0, Res::Whole(&acts.logits)), (2, Res::Whole(&acts.ids))],
         1,
         &engine.uni,
     ));
@@ -1422,15 +1462,22 @@ fn bind(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     label: &str,
-    bufs: &[(u32, &wgpu::Buffer)],
+    bufs: &[(u32, Res)],
     uni_binding: u32,
     uni: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     let mut entries: Vec<wgpu::BindGroupEntry> = bufs
         .iter()
-        .map(|(b, buf)| wgpu::BindGroupEntry {
+        .map(|(b, res)| wgpu::BindGroupEntry {
             binding: *b,
-            resource: buf.as_entire_binding(),
+            resource: match res {
+                Res::Whole(buf) => buf.as_entire_binding(),
+                Res::Part(p) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &p.buf,
+                    offset: p.offset,
+                    size: std::num::NonZeroU64::new(p.size),
+                }),
+            },
         })
         .collect();
     entries.push(wgpu::BindGroupEntry {
@@ -1608,71 +1655,106 @@ fn buf_entry(binding: u32, read_only: bool, dynamic: bool) -> wgpu::BindGroupLay
     }
 }
 
-fn upload_layer(gpu: &Gpu, layer: &mut crate::weights::Layer) -> Result<LayerGpu> {
+fn upload_layer(gpu: &Gpu, slab: &mut Slab, layer: &mut crate::weights::Layer) -> Result<LayerGpu> {
     let in_dim = layer.in_dim as u32;
     Ok(LayerGpu {
-        n1w: up_f32(gpu, &std::mem::take(&mut layer.n1_w))?,
-        n1b: up_f32(gpu, &std::mem::take(&mut layer.n1_b))?,
-        qkv: up_mat(
+        n1w: slab.put(gpu, &std::mem::take(&mut layer.n1_w))?,
+        n1b: slab.put(gpu, &std::mem::take(&mut layer.n1_b))?,
+        qkv: slab_put_mat(
+            slab,
             gpu,
             &std::mem::take(&mut layer.qkv.w),
             layer.qkv.rows,
             layer.qkv.cols,
             layer.qkv.rows,
         )?,
-        qkv_b: up_bias(gpu, &std::mem::take(&mut layer.qkv.b), layer.qkv.rows)?,
-        fsmn: up_f32(gpu, &std::mem::take(&mut layer.fsmn))?,
-        outw: up_mat(
+        qkv_b: slab_put_bias(slab, gpu, &std::mem::take(&mut layer.qkv.b), layer.qkv.rows)?,
+        fsmn: slab.put(gpu, &std::mem::take(&mut layer.fsmn))?,
+        outw: slab_put_mat(
+            slab,
             gpu,
             &std::mem::take(&mut layer.out.w),
             layer.out.rows,
             layer.out.cols,
             layer.out.rows,
         )?,
-        outb: up_bias(gpu, &std::mem::take(&mut layer.out.b), layer.out.rows)?,
-        n2w: up_f32(gpu, &std::mem::take(&mut layer.n2_w))?,
-        n2b: up_f32(gpu, &std::mem::take(&mut layer.n2_b))?,
-        w1: up_mat(
+        outb: slab_put_bias(slab, gpu, &std::mem::take(&mut layer.out.b), layer.out.rows)?,
+        n2w: slab.put(gpu, &std::mem::take(&mut layer.n2_w))?,
+        n2b: slab.put(gpu, &std::mem::take(&mut layer.n2_b))?,
+        w1: slab_put_mat(
+            slab,
             gpu,
             &std::mem::take(&mut layer.w1.w),
             layer.w1.rows,
             layer.w1.cols,
             layer.w1.rows,
         )?,
-        w1b: up_bias(gpu, &std::mem::take(&mut layer.w1.b), layer.w1.rows)?,
-        w2: up_mat(
+        w1b: slab_put_bias(slab, gpu, &std::mem::take(&mut layer.w1.b), layer.w1.rows)?,
+        w2: slab_put_mat(
+            slab,
             gpu,
             &std::mem::take(&mut layer.w2.w),
             layer.w2.rows,
             layer.w2.cols,
             layer.w2.rows,
         )?,
-        w2b: up_bias(gpu, &std::mem::take(&mut layer.w2.b), layer.w2.rows)?,
+        w2b: slab_put_bias(slab, gpu, &std::mem::take(&mut layer.w2.b), layer.w2.rows)?,
         in_dim,
     })
 }
 
-fn up_bias(gpu: &Gpu, data: &[f32], cols_pad: usize) -> Result<wgpu::Buffer> {
-    let mut v = vec![0f32; cols_pad];
-    v[..data.len()].copy_from_slice(data);
-    up_f32(gpu, &v)
+/// Bytes every weight tensor needs inside the slab, 256-byte aligned.
+fn weights_bytes(w: &crate::weights::Weights) -> u64 {
+    fn a(n: usize) -> u64 {
+        ((n as u64) * 4 + 255) & !255
+    }
+    let mut total = 0u64;
+    for l in w.layers.iter().chain(w.tp.iter()) {
+        total += a(l.n1_w.len())
+            + a(l.n1_b.len())
+            + a(l.qkv.w.len())
+            + a(l.qkv.b.len())
+            + a(l.fsmn.len())
+            + a(l.out.w.len())
+            + a(l.out.b.len())
+            + a(l.n2_w.len())
+            + a(l.n2_b.len())
+            + a(l.w1.w.len())
+            + a(l.w1.b.len())
+            + a(l.w2.w.len())
+            + a(l.w2.b.len());
+    }
+    total += a(w.after_w.len()) + a(w.after_b.len()) + a(w.tp_w.len()) + a(w.tp_b.len());
+    total += a(CTC_PAD * w.ctc.cols) + a(CTC_PAD);
+    total + 4096
 }
 
-/// Row-major `[rows, cols]` into a `[rows_pad, cols]` buffer. The pad rows are
-/// the tail, so the source uploads as one contiguous slice and the tail is
-/// zeroed first — building a padded host copy just to insert ~60 KB of zeros
-/// costs the full matrix again for the CTC head (51 MB).
-fn up_mat(gpu: &Gpu, data: &[f32], rows: usize, cols: usize, rows_pad: usize) -> Result<wgpu::Buffer> {
-    assert_eq!(data.len(), rows * cols, "up_mat source shape");
-    let buf = gpu.storage("f32", (rows_pad * cols * 4) as u64);
-    if rows_pad > rows {
-        let mut enc = gpu.device.create_command_encoder(&Default::default());
-        enc.clear_buffer(&buf, 0, None);
-        gpu.queue.submit([enc.finish()]);
-        gpu.flush()?;
+fn slab_put_mat(
+    slab: &mut Slab,
+    gpu: &Gpu,
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+    rows_pad: usize,
+) -> Result<Part> {
+    assert_eq!(data.len(), rows * cols, "slab_put_mat source shape");
+    if rows_pad == rows {
+        return slab.put(gpu, data);
     }
-    gpu.upload_chunked(&buf, bytemuck::cast_slice(data))?;
-    Ok(buf)
+    let mut v = vec![0f32; rows_pad * cols];
+    for r in 0..rows {
+        v[r * cols..(r + 1) * cols].copy_from_slice(&data[r * cols..(r + 1) * cols]);
+    }
+    slab.put(gpu, &v)
+}
+
+fn slab_put_bias(slab: &mut Slab, gpu: &Gpu, data: &[f32], cols_pad: usize) -> Result<Part> {
+    if cols_pad == data.len() {
+        return slab.put(gpu, data);
+    }
+    let mut v = vec![0f32; cols_pad];
+    v[..data.len()].copy_from_slice(data);
+    slab.put(gpu, &v)
 }
 
 fn up_f32(gpu: &Gpu, data: &[f32]) -> Result<wgpu::Buffer> {
