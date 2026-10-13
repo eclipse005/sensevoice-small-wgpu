@@ -189,6 +189,11 @@ pub fn fsmn() -> String {
 @group(0) @binding(2) var<uniform> cfg: FsmnCfg;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(4) var<storage, read> Src: array<f32>;
+/// Concatenated-segment runs put several utterances in one sequence; every
+/// row carries its segment id and this pass only crosses rows that share it.
+/// Single-utterance runs fill the buffer with one id, which reproduces the
+/// plain `t_valid` masking exactly.
+@group(0) @binding(5) var<storage, read> Ids: array<u32>;
 
 @compute @workgroup_size(256)
 fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -203,7 +208,7 @@ fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc = 0.0;
     for (var k: u32 = 0u; k < 11u; k = k + 1u) {
         let src = i32(t + k) - 5;
-        if (src >= 0 && u32(src) < cfg.t_valid) {
+        if (src >= 0 && u32(src) < cfg.t_valid && Ids[u32(src)] == Ids[t]) {
             let v = Qkv[u32(src) * 1536u + 1024u + c];
             acc = acc + v * W[k * 512u + c];
         }
@@ -226,6 +231,7 @@ pub fn fsmn_rows() -> String {
 @group(0) @binding(2) var<uniform> cfg: FsmnCfg;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
 @group(0) @binding(4) var<storage, read> Src: array<f32>;
+@group(0) @binding(5) var<storage, read> Ids: array<u32>;
 
 @compute @workgroup_size(256)
 fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -240,7 +246,7 @@ fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc = 0.0;
     for (var k: u32 = 0u; k < 11u; k = k + 1u) {
         let src = i32(t + k) - 5;
-        if (src >= 0 && u32(src) < cfg.t_valid) {
+        if (src >= 0 && u32(src) < cfg.t_valid && Ids[u32(src)] == Ids[t]) {
             let v = Qkv[u32(src) * 1536u + 1024u + c];
             acc = acc + v * W[c * 11u + k];
         }
@@ -257,6 +263,7 @@ pub fn softmax() -> String {
     "struct SoftCfg { t_valid: u32, t_pad: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read_write> S: array<f32>;
 @group(0) @binding(1) var<uniform> cfg: SoftCfg;
+@group(0) @binding(2) var<storage, read> Ids: array<u32>;
 var<workgroup> red: array<f32, 256>;
 
 fn score_at(row: u32, j: u32) -> f32 {
@@ -270,9 +277,12 @@ fn softmax(@builtin(workgroup_id) wid: vec3<u32>,
     let lane = lid.x;
     let n = cfg.t_pad;
     let valid = cfg.t_valid;
+    // `wid.x` is head-major over the (head, frame) grid; the segment id is
+    // indexed by frame, so fold the head back out.
+    let me_id = Ids[row % n];
     var m = -1.0e30;
     for (var j: u32 = lane; j < valid; j = j + 256u) {
-        m = max(m, score_at(row, j));
+        if (Ids[j] == me_id) { m = max(m, score_at(row, j)); }
     }
     red[lane] = m;
     workgroupBarrier();
@@ -283,7 +293,7 @@ fn softmax(@builtin(workgroup_id) wid: vec3<u32>,
     let maxv = red[0];
     var sum = 0.0;
     for (var j: u32 = lane; j < valid; j = j + 256u) {
-        sum = sum + exp(score_at(row, j) - maxv);
+        if (Ids[j] == me_id) { sum = sum + exp(score_at(row, j) - maxv); }
     }
     red[lane] = sum;
     workgroupBarrier();
@@ -294,7 +304,7 @@ fn softmax(@builtin(workgroup_id) wid: vec3<u32>,
     let inv = 1.0 / red[0];
     for (var j: u32 = lane; j < n; j = j + 256u) {
         var v = 0.0;
-        if (j < valid) { v = exp(score_at(row, j) - maxv) * inv; }
+        if (j < valid && Ids[j] == me_id) { v = exp(score_at(row, j) - maxv) * inv; }
         S[row * n + j] = v;
     }
 }
@@ -310,6 +320,7 @@ pub fn softmax_cached() -> String {
     "struct SoftCfg { t_valid: u32, t_pad: u32, _p0: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read_write> S: array<f32>;
 @group(0) @binding(1) var<uniform> cfg: SoftCfg;
+@group(0) @binding(2) var<storage, read> Ids: array<u32>;
 var<workgroup> red: array<f32, 256>;
 var<workgroup> row: array<f32, 4096>;
 
@@ -320,12 +331,14 @@ fn softmax_cached(@builtin(workgroup_id) wid: vec3<u32>,
     let lane = lid.x;
     let n = cfg.t_pad;
     let valid = cfg.t_valid;
+    // Head-major grid: the id array is indexed by frame.
+    let me_id = Ids[r % n];
     for (var j: u32 = lane; j < n; j = j + 256u) {
         row[j] = S[r * n + j];
     }
     var m = -1.0e30;
     for (var j: u32 = lane; j < valid; j = j + 256u) {
-        m = max(m, row[j]);
+        if (Ids[j] == me_id) { m = max(m, row[j]); }
     }
     red[lane] = m;
     workgroupBarrier();
@@ -336,7 +349,7 @@ fn softmax_cached(@builtin(workgroup_id) wid: vec3<u32>,
     let maxv = red[0];
     var sum = 0.0;
     for (var j: u32 = lane; j < valid; j = j + 256u) {
-        sum = sum + exp(row[j] - maxv);
+        if (Ids[j] == me_id) { sum = sum + exp(row[j] - maxv); }
     }
     red[lane] = sum;
     workgroupBarrier();
@@ -347,7 +360,7 @@ fn softmax_cached(@builtin(workgroup_id) wid: vec3<u32>,
     let inv = 1.0 / red[0];
     for (var j: u32 = lane; j < n; j = j + 256u) {
         var v = 0.0;
-        if (j < valid) { v = exp(row[j] - maxv) * inv; }
+        if (j < valid && Ids[j] == me_id) { v = exp(row[j] - maxv) * inv; }
         S[r * n + j] = v;
     }
 }
@@ -568,6 +581,7 @@ var<workgroup> red: array<f32, 128>;
 fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
                 @builtin(local_invocation_id) lid: vec3<u32>) {
     let row = wid.x;
+    let xrow = cfg._p0 + row;
     let scale = sqrt(512.0);
     if (row < 4u) {
         let ids = array<u32, 4>(cfg.lid, 1u, 2u, cfg.itn);
@@ -580,7 +594,7 @@ fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
             } else {
                 v = v + cos(pos * PosInv[j - 280u]);
             }
-            X[row * 560u + j] = v;
+            X[xrow * 560u + j] = v;
         }
         return;
     }
@@ -602,7 +616,7 @@ fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
         } else {
             v = v + cos(pos * PosInv[j - 280u]);
         }
-        X[row * 560u + j] = v;
+        X[xrow * 560u + j] = v;
     }
     red[lid.x] = part;
     workgroupBarrier();
@@ -610,7 +624,7 @@ fn lfr_features(@builtin(workgroup_id) wid: vec3<u32>,
         if (lid.x < off) { red[lid.x] = red[lid.x] + red[lid.x + off]; }
         workgroupBarrier();
     }
-    if (lid.x == 0u) { RowSum[lr] = red[0]; }
+    if (lid.x == 0u) { RowSum[cfg._p1 + lr] = red[0]; }
 }
 "
     .to_string()

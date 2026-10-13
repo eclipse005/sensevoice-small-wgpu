@@ -868,3 +868,9 @@ GPU 轨道（2026-10-13 第一轮已完成，见 §5.8）：
 - 据此 ② 的验收口径为：逐素材峰值进程 RAM ≤ CUDA 实测；峰值 devVRAM **相当（允许高出 ≤10%）或更低**。
 - 现状：RAM 6/6 低于 CUDA（969–979 MiB vs 1.33–1.58 GB）；devVRAM 5/6 低于 CUDA，唯一高出项 15s_en 1093 vs 1044 = **+4.7%（<10%，达标）**。
 - 转录对齐（同提交 fa6982f 复验）：GPU 6/6、CPU 6/6 gold 逐 token 一致；CPU 全迹 78/78 逐字节一致。
+
+### 5.8.14 分段 RTFx：pad 自适应 + 多段拼接（SVS_SEG_CONCAT）
+- **pad 自适应**（8774714）：短段走 64x64 tile 族，pad 步长 `t<=512 ? 64 : 128`，不再一律 128 行 → 真实 VAD 切点下 +12~14%。
+- **多段拼接**（默认开，`SVS_SEG_CONCAT=0` 回退）：各段拼成一条序列（每段自带 4 个 query 行），softmax/FSMN 用逐行段 id 做块对角 mask；单段时 id 全 0，与旧的 `t_valid` 掩码位级相同。**踩坑**：softmax 网格是 head-major（x = 4·pad），最初用 `Ids[row]` 导致 head>0 读错段 id → 第 2 段起泄漏（同音频双段测试掩盖了它），改为 `Ids[row % t_pad]` 后逐行 argmax 与逐段路径 **0 行不一致**（`tools/mini_eval/seg_concat_check.py`，2/3/5 段）。
+- **择优**：拼接的 attention 仍付 O(T²)（有用仅 Σt²），按实测代价模型选择（每段 ~20 ms vs 每浪费对 ~50 ns），段少而长时回退逐段。
+- 结果（官方 fsmn-vad，30 s 切点）：merge=0 时 78.1→**190.6**（180s_en）、106.1→**205.7**（90s_en）；merge=15s 时保持 191.8~206.2。文本 8/8 与 Python 一致；11 个回退开关 × 6 素材 gold 全绿。

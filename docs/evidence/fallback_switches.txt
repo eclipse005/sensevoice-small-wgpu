@@ -1,6 +1,3 @@
-# 同二进制回退开关验证（objective 硬约束）
-# 每个开关取回退值后跑 GPU gold（6 素材），须与默认路径逐 token 一致
-# 生成于 2026-10-13 15:48；修复 SVS_FUSE_ADD 接线前 30s_zh/90s_en 为 ✗
 SVS_TILE_SMALL=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
 SVS_TILE_WIDE=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
 SVS_FUSE_RELU=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
@@ -11,3 +8,4 @@ SVS_FSMN_TAP=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
 SVS_FSMN_FLAT=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
 SVS_BIAS_FOLD=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
 SVS_RB_FUSED=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]
+SVS_SEG_CONCAT=0 : ✓ ✓ ✓ ✓ ✓ ✓  [6/6]

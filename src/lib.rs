@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 
-use crate::ctc::EMO_UNK;
+use crate::ctc::{greedy, EMO_UNK};
 use crate::encoder_cpu::CpuEngine;
 use crate::encoder_gpu::GpuEngine;
 use crate::frontend::{Frontend, LFR_N, SHIFT, WINDOW};
@@ -244,6 +244,80 @@ impl Model {
         let mut n_input = 0usize;
         let mut segments = Vec::new();
         let mut raws = Vec::new();
+        // Multi-segment GPU runs concatenate the segments into one encoder pass.
+        // A short segment's every GEMM grid is one or two m blocks, so 50 short
+        // VAD cuts leave the card idle; one long sequence fills it. The softmax
+        // and FSMN masks read the per-row segment ids so the utterances never
+        // see each other. `SVS_SEG_CONCAT=0` restores the per-segment loop.
+        let mut concat_done = false;
+        if jobs.len() > 1 && tuning::seg_concat() {
+            if let Engine::Gpu(gpu) = &mut self.engine {
+                // (job index, first row, frame count, first row-sums slot)
+                let mut layout: Vec<(usize, usize, usize, usize)> = Vec::new();
+                let mut total_rows = 0usize;
+                let mut total_lfr = 0usize;
+                for (i, (_, _, audio)) in jobs.iter().enumerate() {
+                    if audio.len() < WINDOW {
+                        continue;
+                    }
+                    let n_fbank = 1 + (audio.len() - WINDOW) / SHIFT;
+                    let lfr_rows = (n_fbank + LFR_N - 1) / LFR_N;
+                    layout.push((i, total_rows, lfr_rows, total_lfr));
+                    total_rows += lfr_rows + 4;
+                    total_lfr += lfr_rows;
+                }
+                // Concatenation trades a fixed per-segment overhead (a short
+                // segment's GEMM grids are one or two m blocks, so each cut
+                // pays ~20 ms of underutilised launch) for an O(T^2) sweep
+                // over the masked-out attention pairs (~50 ns each, measured).
+                // Many short VAD cuts win big; a handful of 15 s segments lose.
+                let waste: u64 = (total_rows * total_rows) as u64
+                    - layout.iter().map(|l| ((l.2 + 4) * (l.2 + 4)) as u64).sum::<u64>();
+                let worth_it = (layout.len() as u64) * 20_000_000 > 50 * waste;
+                if layout.len() < 2 || !worth_it {
+                    // Prefer the per-segment loop: one usable segment, or the
+                    // attention's quadratic term costs more than the launches.
+                } else {
+                    gpu.reserve_frames(total_rows)?;
+                    let mut ids: Vec<u32> = Vec::with_capacity(total_rows);
+                    for si in 0..layout.len() {
+                        for _ in 0..layout[si].2 + 4 {
+                            ids.push(si as u32);
+                        }
+                    }
+                    for &(i, row_off, lfr_rows, sum_off) in &layout {
+                        let (_, _, audio) = jobs[i];
+                        let n_fbank = 1 + (audio.len() - WINDOW) / SHIFT;
+                        let t = lfr_rows + 4;
+                        let t0 = Instant::now();
+                        gpu.run_frontend_at(
+                            audio, n_fbank, t, lid as u32, itn as u32, row_off, sum_off,
+                        )?;
+                        frontend_ms += elapsed_ms(t0);
+                        n_lfr += lfr_rows;
+                        n_input += t;
+                    }
+                    let t1 = Instant::now();
+                    let (frames, fs) = gpu.encode_frames(total_rows, total_lfr, ban, Some(&ids))?;
+                    encode_ms += elapsed_ms(t1);
+                    feat_sum += fs;
+                    for &(i, row_off, lfr_rows, _) in &layout {
+                        let toks = greedy(&frames[row_off..row_off + lfr_rows + 4]);
+                        let raw = self.tok.decode(&toks);
+                        raws.push(raw.clone());
+                        let (start, end, _) = jobs[i];
+                        segments.push(SegmentOut {
+                            start_ms: start,
+                            end_ms: end,
+                            raw,
+                            token_ids: toks,
+                        });
+                    }
+                    concat_done = true;
+                }
+            }
+        }
+        if !concat_done {
         for (start, end, audio) in jobs {
             if audio.len() < WINDOW {
                 continue;
@@ -288,6 +362,7 @@ impl Model {
                 raw,
                 token_ids: ids,
             });
+        }
         }
         let t2 = Instant::now();
         let raw = raws.join(" ");

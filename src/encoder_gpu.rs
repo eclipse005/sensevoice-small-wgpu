@@ -298,6 +298,10 @@ struct Acts {
     wave: wgpu::Buffer,
     fbank: wgpu::Buffer,
     row_sums: wgpu::Buffer,
+    /// One u32 per row: which segment the row belongs to. The softmax and FSMN
+    /// masks use it so a concatenated multi-segment run never crosses
+    /// utterances; single-utterance runs leave it all zero.
+    seg_ids: wgpu::Buffer,
 }
 
 struct LayerItem {
@@ -544,6 +548,24 @@ impl GpuEngine {
         lid: u32,
         itn: u32,
     ) -> Result<()> {
+        self.run_frontend_at(samples, n_fbank, t, lid, itn, 0, 0)
+    }
+
+    /// [`Self::run_frontend`] writing this segment's rows at `row_off` in the
+    /// shared input buffer and its CMVN row sums at `sum_off`. The concatenated
+    /// multi-segment path calls it once per segment so one encoder pass can run
+    /// over all of them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_frontend_at(
+        &mut self,
+        samples: &[f32],
+        n_fbank: usize,
+        t: usize,
+        lid: u32,
+        itn: u32,
+        row_off: usize,
+        sum_off: usize,
+    ) -> Result<()> {
         self.ensure(t)?;
         let (fbank_bg, lfr_bg) = self.front_bg.as_ref().context("frontend bind groups")?;
         let acts = self.acts.as_ref().unwrap();
@@ -574,8 +596,8 @@ impl GpuEngine {
                 t: t as u32,
                 lid,
                 itn,
-                _p0: 0,
-                _p1: 0,
+                _p0: row_off as u32,
+                _p1: sum_off as u32,
                 _p2: 0,
             }),
         );
@@ -620,8 +642,36 @@ impl GpuEngine {
 
     /// Run the encoder graph on whatever `run_frontend` left in the shared
     /// input buffer.
+    /// Token ids for one utterance (greedy, deduplicated).
     pub fn encode(&mut self, t: usize, n_lfr: usize, ban: Option<usize>) -> Result<(Vec<i32>, f32)> {
+        let (frames, fs) = self.encode_frames(t, n_lfr, ban, None)?;
+        Ok((greedy(&frames), fs))
+    }
+
+    /// Per-row CTC argmax before greedy collapsing. `seg_ids`, when given, holds
+    /// one segment id per row of a concatenated multi-segment run; the softmax
+    /// and FSMN masks use it to keep utterances apart. Without it every row
+    /// gets id 0, which reduces those masks to the plain `t_valid` checks.
+    pub fn encode_frames(
+        &mut self,
+        t: usize,
+        n_lfr: usize,
+        ban: Option<usize>,
+        seg_ids: Option<&[u32]>,
+    ) -> Result<(Vec<i32>, f32)> {
         let pad = self.ensure(t)?;
+        {
+            let zeros;
+            let src: &[u32] = match seg_ids {
+                Some(s) => s,
+                None => {
+                    zeros = vec![0u32; t];
+                    &zeros
+                }
+            };
+            let buf = self.acts.as_ref().unwrap().seg_ids.clone();
+            self.gpu.write_at(&buf, 0, bytemuck::cast_slice(src));
+        }
         let ids = self.acts.as_ref().unwrap().ids.clone();
         let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
         let t0 = std::time::Instant::now();
@@ -748,7 +798,6 @@ impl GpuEngine {
             bail!("GPU 校验失败: {err}");
         }
         let d_rb = t0.elapsed().as_secs_f64() * 1e3;
-        let t0 = std::time::Instant::now();
         let mut frames = Vec::with_capacity(t);
         for c in id_bytes.chunks_exact(4) {
             frames.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
@@ -756,8 +805,16 @@ impl GpuEngine {
         if tuning::gpu_debug() {
             self.dump_debug(pad, t, ops.len(), &frames)?;
         }
-        let out = greedy(&frames);
-        let d_gd = t0.elapsed().as_secs_f64() * 1e3;
+        if let Ok(path) = std::env::var("SVS_DUMP_FRAMES") {
+            let mut bytes = Vec::with_capacity(frames.len() * 4);
+            for v in &frames {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).expect("dump frames");
+            eprintln!("dumped frames n={} -> {path}", frames.len());
+        }
+        let out = frames;
+        let d_gd = 0.0f64;
         // `SVS_CPU_PROF=1`: the timed-region CPU accounting the objective's
         // criterion ③ refers to (upload + readback + scheduling, no math).
         // The six `Instant::now` calls cost well under a microsecond.
@@ -1373,6 +1430,7 @@ impl Acts {
             wave: gpu.storage("wave", ((alloc * 960 + 960) * 4) as u64),
             fbank: gpu.storage("fbank", (alloc * 480 * 4) as u64),
             row_sums: gpu.storage("row_sums", (alloc * 4) as u64),
+            seg_ids: gpu.storage("seg_ids", (alloc * 4) as u64),
         })
     }
 
@@ -1427,7 +1485,7 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
         Res::Whole(&acts.v)
     };
     let qk = push(bind(dev, &pipes.gemm_l, "qk", &[(0, Res::Whole(&acts.q)), (1, k_b), (2, Res::Whole(&acts.scores))], 3, &engine.uni));
-    let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, Res::Whole(&acts.scores))], 1, &engine.uni));
+    let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, Res::Whole(&acts.scores)), (2, Res::Whole(&acts.seg_ids))], 1, &engine.uni));
     let av = push(bind(
         dev, &pipes.gemm_l, "av",
         // The fused variant writes each head straight into `ctx` (the C stride
@@ -1485,6 +1543,7 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
                 (1, Res::Part(&layer.fsmn)),
                 (3, Res::Whole(fsmn_out)),
                 (4, Res::Whole(src_buf)),
+                (5, Res::Whole(&acts.seg_ids)),
             ],
             2,
             &engine.uni,
@@ -1626,9 +1685,9 @@ impl Pipes {
         let ln_l = bgl(dev, "ln", &[ro(0), ro(1), ro(2), uni(3), rw(4)]);
         let gemm_l = bgl(dev, "gemm", &[ro(0), ro(1), rw(2), uni(3)]);
         let gemm_b_l = bgl(dev, "gemm-b", &[ro(0), ro(1), rw(2), uni(3), ro(4)]);
-        let fsmn_l = bgl(dev, "fsmn", &[ro(0), ro(1), uni(2), rw(3), ro(4)]);
+        let fsmn_l = bgl(dev, "fsmn", &[ro(0), ro(1), uni(2), rw(3), ro(4), ro(5)]);
         let split_l = bgl(dev, "split", &[ro(0), rw(1), rw(2), rw(3), uni(4)]);
-        let soft_l = bgl(dev, "soft", &[rw(0), uni(1)]);
+        let soft_l = bgl(dev, "soft", &[rw(0), uni(1), ro(2)]);
         let merge_l = bgl(dev, "merge", &[ro(0), rw(1), uni(2)]);
         let add_l = bgl(dev, "add", &[ro(0), ro(1), rw(2), uni(3)]);
         let relu_l = bgl(dev, "relu", &[rw(0), uni(1)]);

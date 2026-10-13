@@ -119,6 +119,14 @@ pub fn tile_wide() -> bool {
     *W.get_or_init(|| std::env::var("SVS_TILE_WIDE").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_SEG_CONCAT=0` runs VAD segments one at a time instead of
+/// concatenating them into one encoder pass (the pre-optimization behaviour,
+/// and the paired A/B control for it).
+pub fn seg_concat() -> bool {
+    static C: OnceLock<bool> = OnceLock::new();
+    *C.get_or_init(|| std::env::var("SVS_SEG_CONCAT").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_RB_FUSED=0` reads the transcript back through the one-shot
 /// `readback_many` path (fresh staging buffer, extra queue sync) instead of the
 /// reused staging buffer whose copies ride the graph's last submission.
