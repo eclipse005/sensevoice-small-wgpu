@@ -563,16 +563,24 @@ impl GpuEngine {
     fn dump_prof(&self, qset: &wgpu::QuerySet, ops: &[Op]) -> Result<()> {
         let n = ops.len();
         let bytes = (n * 2 * 8) as u64;
-        let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        // wgpu forbids MAP_READ together with QUERY_RESOLVE (a mappable buffer
+        // may only pair with the opposite COPY). Resolve into an intermediate
+        // and copy that into the staging buffer, same as `Gpu::readback`.
+        let resolve = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("prof-resolve"),
             size: bytes,
-            usage: wgpu::BufferUsages::MAP_READ
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::QUERY_RESOLVE,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prof-staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        enc.resolve_query_set(qset, 0..(n * 2) as u32, &staging, 0);
+        enc.resolve_query_set(qset, 0..(n * 2) as u32, &resolve, 0);
+        enc.copy_buffer_to_buffer(&resolve, 0, &staging, 0, bytes);
         self.gpu.queue.submit([enc.finish()]);
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
