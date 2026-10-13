@@ -3,6 +3,10 @@
 > 交接时间：2026-10-12 20:50 左右
 > 交接人：mavis（被用户中断，交由下一个 AI 接手）
 > 文档目的：让接手者无需重读全部历史即可继续推进。
+>
+> **2026-10-13 更新**：CPU 路径优化已闭环（确定性修复 + 2 项位级等价优化，
+> RTFx 全面提升，详见 §4.4–4.8），代码已入本地 git（3 个提交）。
+> GPU 剖面轨道（§5）暂缓，状态已同步。**工作区真相源是代码，本文档仅次之。**
 
 ---
 
@@ -11,9 +15,19 @@
 **目标**（用户原话）：在**完全对齐**（逐 token 一致于 gold）的前提下把 RTFx 优化到极致，
 并且**要么专注 CPU、要么专注 wgpu GPU，把一个做到极致**。已拍板**专注 GPU 路径**。
 
-**当前状态**：GPU 路径已稳定通过 6/6 对齐，RTFx 已达原版 CUDA 的 0.5–3.6 倍、
-原版 CPU 的 3–6 倍。**正在做"逐 op GPU 时间戳剖面"以定位剩余瓶颈，该工作卡在一个
-已修但未编译的 bug 上**（见 §5）。
+**2026-10-13 现状**（CPU 突击，已闭环）：
+
+- **偶发非确定性已根治**：根因是 gemm-common `CACHE_INFO` 惰性 CPUID 在 P/E 核上
+  生成不同分块参数（详见 §4.4），`freeze_gemm_tiling()` 冻结后 40/40 确定。
+- **CPU RTFx 全面提升**（90s_en 61.4 → **86.6**，+41%），全部优化**位级等价**，
+  6/6 gold 通过，逐项有同二进制回退开关。
+- **代码已入本地 git**：`0be4b36` 初始 → `32cc464` FSMN → `a6f068c` CTC，工作区干净。
+- **GPU 剖面轨道（§5）暂缓**：QUERY_RESOLVE 修复**已编译进当前 exe**（见 §5.4），
+  只差跑一次 `SVS_GPU_PROF=1` 验证时间戳。
+- 用户已拍板：**softmax exp 向量化暂不做**（非位级等价，数值高风险，2026-10-13）。
+
+**GPU 轨道既有状态**（2026-10-12）：GPU 路径已稳定通过 6/6 对齐，RTFx 已达原版 CUDA 的
+0.5–3.6 倍、原版 CPU 的 3–6 倍。"逐 op GPU 时间戳剖面"卡点已解除（修复已编译），待验证。
 
 ---
 
@@ -37,7 +51,9 @@
   - 适配器名匹配请用 `--device "P104"`（**不要用 `vulkan:1`，索引会落到核显**）。
   - `max_storage_buffer_binding_size` = 2047 MiB
   - workgroup 共享内存上限 = **49152 字节（48KB）** ← GEMM 的硬约束
-- CPU：20 逻辑核，31.48 GB RAM
+- CPU：20 逻辑核（**Arrow Lake 混合架构：8 P 核 + 12 E 核，不连续分布**），31.48 GB RAM
+  - P 核 L1d 48K/12 路，E 核 L1d 32K/8 路 → **gemm 分块参数随首次调用所在核而变**，
+    是曾导致偶发非确定性的根因（见 §4.4），现已由 `freeze_gemm_tiling()` 冻结。
 
 ### 1.3 运行命令模板
 
@@ -52,14 +68,37 @@ $env:SVS_GPU_PROF = ''   # 平时清空
     --check-gold ".\gold\90s_en.json"
 # 期望：gold: 一致，exit=0
 
+# 对齐验证（CPU，本轮工作以 CPU 为主）
+& ".\target\release\sensevoice.exe" `
+    --wav "D:\SenseVoiceSmall\fixtures\90s_en.wav" `
+    --device "cpu" `
+    --check-gold ".\gold\90s_en.json"
+# 期望：exit=0。判断 gold 一律看退出码，别匹配中文"一致"（见 §6.8）
+
 # 全量基准（6 素材，带内存监控）
 cd D:\SenseVoiceSmall\_scratch
 & .\bench_rust.ps1 -Device "P104"
 
+# CPU 全量基准 + 配对 A/B（本轮收尾用）
+& .\bench_rtfx.ps1
+
 # 单元测试
 cd D:\SenseVoiceSmall\SenseVoiceSmall-wgpu
-cargo test --release      # 10/10 应通过
+cargo test --release      # 12/12 应通过
 ```
+
+### 1.4 CPU 路径同二进制回退开关（每项优化一个，均可即时关闭）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `SVS_BIAS_FOLD=0` | 开 | 关闭 bias+relu 融合，回退两遍扫描 |
+| `SVS_GEMM_THREADS` | 开 | 置 `0` 回退 gemm crate 默认线程分块 |
+| `SVS_GEMM_CACHE=max\|min\|off` | `max` | 冻结 gemm 分块参数的 regime（`off`=不冻结） |
+| `SVS_FSMN_FLAT=0` | 开 | 回退 FSMN 旧循环嵌套（通道外层） |
+| `SVS_CTC_TILE=N` | 2048 | CTC vocab 分块宽；`0`=整体式（151MB 工作集） |
+| `SVS_CPU_PROF=1` | 关 | CPU 分相计时（ln/qkv/fsmn/softmax/… 桶） |
+| `SVS_TRACE=1` | 关 | 分层 trace（`{:.9}` + FNV 哈希），位级门禁用 |
+| `SVS_TRACE_FINE=1` | 关 | 层内细粒度 trace_f 插桩（诊断用，9 处/层） |
 
 ---
 
@@ -174,7 +213,98 @@ GEMM_SMEM = 2*(128+128)*8*4 = 16384   // 双缓冲，48KB 上限内安全
 
 ---
 
-## 5. 进行中的工作：逐 op GPU 时间戳剖面（**接手者的第一件事**）
+## 4.4 CPU 突击（2026-10-13）：偶发非确定性根治（**必读，勿退回**）
+
+**现象**：同一二进制、同一输入，40 次运行中偶发输出分叉，但分叉后各自稳定
+（两个离散吸引子，L0 起 2 ULP 级差异 → 全链分叉）。
+
+**根因**（证据链完整，勿再怀疑 gemm 内部竞争）：gemm-common 0.18.2 的
+`CACHE_INFO` 是 `OnceCell` **惰性**初始化，首次 GEMM 调用时用 **CPUID leaf 4**
+在**当时所在核**上取 L1 参数。本机是 Arrow Lake 混合架构（8P+12E）：
+
+- P 核 L1d 48K/12 路 → `kc = min(1024, k)`
+- E 核 L1d 32K/8 路 → `kc = min(512, k)`
+
+全模型唯一 k=560 的 GEMM 是 **layer 0 的 qkv**：1 个 560 块 vs 2 个 280 块
+→ f32 结合顺序二态 → 双稳态输出。逐 LP 实验 8:12 严格跟随核类型定案。
+
+**修复**：`CpuEngine::new()` 首行调用 `freeze_gemm_tiling()`（`encoder_cpu.rs`）：
+临时 pin 到 L1 最大的 P 核 → 触碰 `CACHE_INFO` → 解除 pin，从此分块参数与调度无关。
+`SVS_GEMM_CACHE=max|min|off` 为同二进制回退开关（`off` = 完全不冻结）。
+修复后 40/40 确定，max/min 各自确定，性能打平 → 默认 `max`（= 历史主导值，
+L0 与旧基线逐位一致，零数学改动）。
+
+**一致性门禁已升级**：trace 从 `sum/max` 标量升级为 `sum={:.9} max={:.9} n h={:016x}`，
+`h` 为 f32 `to_bits` 的 FNV-1a（sum/max 相同 ≠ 缓冲区相同，曾漏检）。
+
+---
+
+## 4.5 CPU 突击：本轮两项位级等价优化（均已提交）
+
+| 项 | 内容 | 分相/工作集收益 | 配对 A/B | 门禁 | 回退开关 | 提交 |
+|---|---|---|---|---|---|---|
+| FSMN 循环翻转 | tap 外层/512 通道内层 + tap-major 权重拷贝；每通道累加链不变 | fsmn **15.0→8.4 ms** | 6/6 胜 | 全迹 78 行 0 差异 | `SVS_FSMN_FLAT` | `32cc464` |
+| CTC vocab 分块 + bias 折进 argmax | fused GEMM+argmax，`acc+b` ≡ 原 `b+acc` | 工作集 **151MB→12MB**，配对均值 **−25 ms** | 4/6 胜（块宽 2048 定夺） | 逐 bit 单测 + 全迹 0 差异 + 6/6 gold | `SVS_CTC_TILE` | `a6f068c` |
+
+关键等价性依据（改动这两处前必读）：
+
+- **FSMN**：每通道累加链保持 tap 升序、从 0.0 起、中心 tap 最后加 → 逐位等价。
+  权重布局重排是纯拷贝，不改数值。
+- **CTC**：k=512 在任意块宽下都是**单个 `kc` 块**（`kc` 只依赖 k 与缓存几何），
+  每 logit 归约顺序不变；bias 直接进比较是同一浮点加法。
+  字节级常驻单测 `ctc_tiling_is_bit_identical`（tests 模块）逐 logit `assert_eq!(to_bits)`。
+
+---
+
+## 4.6 CPU 实测 RTFx（2026-10-13 收尾基准，6 素材 × 3 次取中位）
+
+| 素材 | 优化前基线 | **优化后** | 提升 | encode_ms | frontend_ms |
+|---|---|---|---|---|---|
+| 15s_en  | 57.3 | **74.3** | +30% | 189.4 | 12.4 |
+| 30s_zh  | 64.7 | **90.0** | +39% | 309.8 | 24.6 |
+| 90s_en  | 61.4 | **86.6** | +41% | 967.1 | 72.2 |
+| 90s_ja  | 64.2 | **83.8** | +30% | 990.4 | 72.1 |
+| 180s_en | 48.1 | **61.6** | +28% | 2727.6 | 144.3 |
+| 180s_zh | 46.9 | **59.6** | +27% | 2874.2 | 145.8 |
+
+（"优化前基线"= bias_fold/gemm_threads/FSMN/CTC 全关的本会话测量；
+注意与 §4.1 表中旧"本仓 CPU"列测量条件不同，勿混用。）
+
+累计配对收益（90s_en）：bias_fold+gemm_threads −49 ms、FSMN −6.7 ms、CTC −25 ms。
+6/6 gold 全过（退出码判定）。
+
+---
+
+## 4.7 CPU 优化工程纪律（用户硬性要求，每步都做）
+
+1. **消融/微基准先行**：分相计时（`SVS_CPU_PROF`）或微基准确认收益来源；
+   总时长信噪比不足时**用分相桶消融**（FSMN 项就是靠这个定案的）。
+2. **同二进制回退开关**：每项优化一个环境变量（§1.4），可即时关闭对比。
+3. **紧邻配对 A/B**：on/off 交替跑（6 对取中位/均值），不跨时段比。
+4. **逐字节位级门禁**：`SVS_TRACE=1` 双跑对比全迹 78 行（含 FNV 哈希）0 差异，
+   不许只看 sum/max。基线：`_scratch\trace_base_90s_en.txt`（新格式，78 行）。
+5. **转录精度不变**：6/6 `--check-gold` 退出码必须全 0。
+6. **独立提交**：每项优化一个 git commit，可单独 revert。
+
+验证脚本族（`D:\SenseVoiceSmall\_scratch\`，均幂等、串行）：
+`bench_rtfx.ps1`（全量+配对）、`gate_fsmn.ps1`/`gate_ctc.ps1`（位级+配对+gold）、
+`prof_fsmn.ps1`（分相消融）、`ab_ctc2k4k.ps1`（块宽定夺）、
+`det_sweep.ps1`/`det_pin.ps1`/`det_lp.ps1`/`det_fix.ps1`（确定性定位与复验）。
+
+---
+
+## 4.8 已证伪方向（CPU，勿重试）
+
+- scores 按行分块、ctx 拆 Q/K/V（不省访存或破坏归约）
+- FTZ/DAZ（对结果路径无收益）
+- 打包 padding 残留、L2_SLAB 残留（gemm 静态分析已证干净）
+- gemm crate 内部竞争（真正的非确定性来源是 §4.4 的 CACHE_INFO）
+- softmax exp 向量化 —— **用户已拍板暂不做**（非位级等价，动 f32 exp 语义；
+  若重启需用户批准 + 全迹漂移评估 + 6/6 gold）
+
+---
+
+## 5. GPU 轨道待续：逐 op 时间戳剖面（暂缓，卡点已解除；回到 GPU 时的第一件事）
 
 ### 5.1 为什么做这个
 
@@ -201,7 +331,7 @@ GEMM_SMEM = 2*(128+128)*8*4 = 16384   // 双缓冲，48KB 上限内安全
 prof 路径跑 90s_en：`encode_ms: 650.303 / rtfx: 124.20 / tokens: 310 / gold: 一致 / exit=0`。
 → **每个 dispatch 独立 pass 没有引入可观测开销（650.30 vs 常规 650.34），且结果逐 token 一致。**
 
-### 5.4 当前卡点（**已修但未编译**）
+### 5.4 当前卡点（**已解除：修复已在源码且已编译，只差验证**）
 
 首次 prof 运行：984 dispatch 分类完全正确，但**时间戳全为 0**，且末尾报
 `GPU 校验失败: Validation Error`。根因：
@@ -214,11 +344,11 @@ In a CommandEncoder
 ```
 
 **修复已写入源码**（`src\encoder_gpu.rs:571`，给 prof staging buffer 加
-`wgpu::BufferUsages::QUERY_RESOLVE`），但**用户在我执行 `cargo build` 前中断了**。
+`wgpu::BufferUsages::QUERY_RESOLVE`）。**2026-10-13 核实：修复在源码中，
+且当前 exe（2026-10-13 09:51 构建）晚于 `encoder_gpu.rs`（10-12 20:47），
+即修复已编译进 exe**。尚未重新跑 `SVS_GPU_PROF=1` 验证时间戳。
 
-当前 exe 时间戳 = **20:46:38**，**不含**该修复。
-
-### 5.5 接手者的第一步（照做即可）
+### 5.5 回到 GPU 轨道的第一步（照做即可；`cargo build` 已非必需，跑了无害）
 
 ```powershell
 cd D:\SenseVoiceSmall\SenseVoiceSmall-wgpu
@@ -362,6 +492,18 @@ cargo build --release
 - 注意：8192 帧上限是 `max_frames()` 里 `while next <= 8192` 的**写死循环上界**，
   **不是硬件限制**（该卡硬件上限约 T≈11582）。如果要放开需改这里。
 
+### 6.8 判定 gold 一律看退出码，不要匹配中文（2026-10-13 踩坑）
+
+`bench_rtfx.ps1` 等脚本曾用 `Where-Object { $_ -like '*一致*' }` 判定 gold，
+导致**明明 exit=0 全部通过却显示 `gold_fail=3`**。两个坑叠加：
+
+1. PowerShell 5 读 BOM-less `.ps1` 时把脚本里的中文按 ANSI 解码，匹配串变乱码；
+2. `Start-Process` 的 `ExitCode` 属性需**无参 `WaitForExit()`** 后才刷新
+   （带超时参数的 `WaitForExit(ms)` 不刷新属性）。
+
+**正确做法**：`$p.WaitForExit(); $p.ExitCode -eq 0`；脚本内不写非 ASCII 字面量。
+本仓 `gold` 判定若见全 `False`/`gold_fail` 异常而行为正常，先手动验证退出码再下结论。
+
 ---
 
 ## 7. 代码地图（改哪里看哪里）
@@ -370,11 +512,24 @@ cargo build --release
 |---|---|
 | `src\gemm_f32.rs` | **GEMM WGSL 代码生成器**（具名标量累加器 + 矩形线程 + 双缓冲）。当前最重要的优化文件 |
 | `src\encoder_gpu.rs` | GPU 引擎。`record()` 生成 984 个 op；分批提交在 `encode()`；新增 `dump_prof()` 剖面 |
-| `src\encoder_cpu.rs` | CPU 编码器（rayon 并行 softmax/fsmn/layernorm、Scratch 复用、ping-pong buffer） |
-| `src\ctc.rs` | `argmax_rows`（已 rayon 并行） |
+| `src\encoder_cpu.rs` | CPU 编码器（本轮主战场）：`freeze_gemm_tiling()` 确定性修复、FSMN 翻转、CTC 分块、`trace_on` FNV 门禁、`Prof` 分相 |
+| `src\ctc.rs` | `argmax_tile`（fused bias+argmax，按 vocab 块增量更新 best）+ `greedy` |
 | `src\gpu.rs` | `Gpu::{readback, readback_many, describe}`；共享内存上限检查在 `new_with()` 约 240 行 |
 | `src\shaders.rs` | 非 GEMM 的 WGSL（ln / soft / fsmn / merge / split / add / relu / arg） |
+| `Cargo.toml` | 新增 `gemm-common = "0.18"`（必须与 `gemm` 同版本，共享同一 `CACHE_INFO`） |
 | `README.md` | **含选型实测表、寄存器陷阱、TDR 说明、分块参数结论——但数据仍是双缓冲前的旧值，最终需刷新** |
+
+### 本地 git 仓库
+
+`D:\SenseVoiceSmall\SenseVoiceSmall-wgpu` 已初始化本地 git（无远程），提交历史：
+
+```
+a6f068c CTC 投影按 vocab 分块 + bias 折进 argmax：工作集 151MB→12MB
+32cc464 FSMN 循环嵌套翻转：fsmn 分相 15.0→8.4 ms（6/6 配对胜出）
+0be4b36 初始提交：SenseVoiceSmall 推理（Rust CPU + wgpu）
+```
+
+每项优化一个 commit，可单独 revert。`.gitignore` 含 `/target`、`__pycache__/`、`*.bak*`。
 
 ### `encoder_gpu.rs` 的调试开关
 
@@ -397,7 +552,17 @@ cargo build --release
 
 ## 8. 待办清单
 
-- [ ] **【最高优先】编译并跑通 `SVS_GPU_PROF=1`**（§5.5，修复已在源码，只差 build）
+CPU 轨道（2026-10-13 已闭环，无强制待办）：
+
+- [x] 偶发非确定性根治（`freeze_gemm_tiling`，40/40 确定）
+- [x] FSMN 循环翻转 + CTC vocab 分块（位级等价，各自提交）
+- [x] 新格式 trace 基线重建（`_scratch\trace_base_90s_en.txt`，78 行）+ 6/6 gold + 全量基准
+- [ ] （暂缓，用户已拍板）softmax exp 向量化 —— 非位级等价，重启需用户批准（§4.8）
+- [ ] （可选）`trace_f`/`SVS_TRACE_FINE` 诊断插桩去留（9 处/层）
+
+GPU 轨道（暂缓，按需重启）：
+
+- [ ] **跑通 `SVS_GPU_PROF=1`**（§5.5，修复已编译，只差验证时间戳）
 - [ ] 用剖面数据决定优化方向（GEMM 深挖 vs 算子融合），见 §5.7
 - [ ] vec4 向量化全局加载（A/B tile 访存指令数减少 1/4）—— 若剖面显示 GEMM 仍占大头
 - [ ] GEMM 调优后**重标定 TDR chunk 公式**（单 dispatch 变快后 `(1_400_000/t)` 偏保守，
@@ -410,10 +575,12 @@ cargo build --release
 
 ## 9. 验收标准（最终交付必须全部满足）
 
-1. `cargo test --release` → **10/10 通过**
-2. CPU 路径 6/6 对齐
+1. `cargo test --release` → **12/12 通过**（含 `ctc_tiling_is_bit_identical` 逐 bit 单测）
+2. CPU 路径 6/6 对齐，且 `SVS_TRACE=1` 全迹 78 行与
+   `_scratch\trace_base_90s_en.txt` 逐字节一致（FNV 哈希）
 3. GPU 路径 6/6 对齐
 4. `bench_rust.ps1 -Device "P104"` 六个素材全部 `killed=False`，
-   且 RTFx 优于 §4.1 的当前值
+   且 RTFx 优于 §4.1 的当前值；CPU 侧不劣于 §4.6 的当前值
 5. `README.md` 数据表已刷新为最终实测值
-6. 无残留的实验性开关导致默认路径行为变化
+6. 无残留的实验性开关导致默认路径行为变化（默认值见 §1.4；
+   同二进制回退开关必须保留）
