@@ -240,7 +240,7 @@ pub fn add_posenc(x: &mut [f32], t: usize, depth: usize) {
 }
 
 fn joint(name: &str, x: &[f32]) {
-    if std::env::var("SVS_TRACE").ok().as_deref() != Some("1") {
+    if !crate::tuning::trace() {
         return;
     }
     // Same gate format as `encoder_cpu::trace_on`: full-precision scalars plus

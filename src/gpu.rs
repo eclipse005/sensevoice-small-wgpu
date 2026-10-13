@@ -216,7 +216,7 @@ impl Gpu {
         let mut skipped: Option<anyhow::Error> = None;
         // Per-dispatch GPU timing is diagnostic only, so the optional feature is
         // requested just for `SVS_GPU_PROF=1` runs and stays empty otherwise.
-        let want_prof = std::env::var("SVS_GPU_PROF").ok().as_deref() == Some("1");
+        let want_prof = crate::tuning::gpu_prof();
         for adapter in &candidates {
             let info = adapter.get_info();
             let limits = adapter.limits();

@@ -10,7 +10,9 @@
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
+use crate::cpu_affinity::{pin_to_l1_extreme, unpin};
 use crate::ctc::{argmax_tile, greedy, VOCAB};
+use crate::tuning;
 use crate::weights::{Layer, Weights, HIDDEN, QKV};
 
 const EPS: f32 = 1e-5;
@@ -122,7 +124,7 @@ impl CpuEngine {
     /// Greedy CTC token ids for one utterance. `x` is `[t, 560]` already scaled and position-encoded.
     pub fn encode(&self, x: &[f32], t: usize, ban: Option<usize>) -> Vec<i32> {
         let mut prof = Prof {
-            on: std::env::var("SVS_CPU_PROF").ok().as_deref() == Some("1"),
+            on: tuning::cpu_prof(),
             ..Prof::default()
         };
         let ids = self.encode_inner(x, t, ban, &mut prof);
@@ -153,7 +155,7 @@ impl CpuEngine {
                 self.layer(layer, &buf_b, &mut buf_a, t, true, &mut scratch, prof);
             }
             src_is_a = !src_is_a;
-            if std::env::var("SVS_TRACE").ok().as_deref() == Some("1") {
+            if tuning::trace() {
                 let cur = if src_is_a { &buf_a } else { &buf_b };
                 trace(&format!("L{i}"), cur);
             }
@@ -169,7 +171,7 @@ impl CpuEngine {
         for (i, layer) in self.weights.tp.iter().enumerate() {
             self.layer(layer, &cur, &mut nxt, t, true, &mut scratch, prof);
             std::mem::swap(&mut cur, &mut nxt);
-            if std::env::var("SVS_TRACE").ok().as_deref() == Some("1") {
+            if tuning::trace() {
                 trace(&format!("TP{i}"), &cur);
             }
         }
@@ -182,7 +184,7 @@ impl CpuEngine {
         // single `kc` block at any tile width, so each logit is the same
         // product-sum, and `acc + b` is the same float the old `b + acc`
         // produced — verified against the monolithic setting by the trace gate.
-        let tile_w = ctc_tile();
+        let tile_w = tuning::ctc_tile();
         let mut tile = vec![0f32; t * tile_w];
         let mut best_v = vec![f32::NEG_INFINITY; t];
         let mut frames = vec![0i32; t];
@@ -221,7 +223,7 @@ impl CpuEngine {
         });
         tprof!(prof, ln2, layer_norm(&mut s.norm2, dst, &layer.n2_w, &layer.n2_b, HIDDEN));
         let rows = layer.w1.rows;
-        if bias_fold() {
+        if tuning::bias_fold() {
             tprof!(prof, w1, linear_gemm(&mut s.mid, &s.norm2, &layer.w1.w, t, HIDDEN, rows));
             // bias + relu fused into one pass over `mid` instead of a pre-fill
             // plus a relu sweep. `max(0, acc + b)` is the same float the
@@ -274,7 +276,7 @@ fn sanm(s: &mut Scratch, layer: &Layer, t: usize, prof: &mut Prof) {
     let d_in = layer.in_dim;
     let b = &layer.qkv.b;
     let scale = q_scale();
-    if bias_fold() {
+    if tuning::bias_fold() {
         tprof!(prof, qkv, linear_gemm(&mut s.qkv, &s.norm, &layer.qkv.w, t, d_in, QKV));
         // bias + Q scale fused into one pass. The old order was `qkv = acc + b`
         // over all 1536 cells, then `qkv[..512] *= scale`; fsmn only ever reads
@@ -356,7 +358,7 @@ fn sanm(s: &mut Scratch, layer: &Layer, t: usize, prof: &mut Prof) {
         }
     });
     trace_f("ctx", ctx);
-    if bias_fold() {
+    if tuning::bias_fold() {
         // `out` bias folded into the `y += mem` sweep that had to run anyway:
         // old order was `y = acc + b` then `y += m`, i.e. `(acc + b) + m`.
         tprof!(prof, out, linear_gemm(&mut s.y, ctx, &layer.out.w, t, HIDDEN, HIDDEN));
@@ -384,7 +386,7 @@ fn sanm(s: &mut Scratch, layer: &Layer, t: usize, prof: &mut Prof) {
 /// only swapped so the 11 source rows stream linearly instead of being
 /// revisited once per output channel.
 fn fsmn_into(out: &mut [f32], qkv: &[f32], weight: &[f32], t: usize) {
-    if !fsmn_flat() {
+    if !tuning::fsmn_flat() {
         out.par_chunks_mut(HIDDEN)
             .enumerate()
             .for_each(|(time, dst)| {
@@ -435,39 +437,6 @@ fn fsmn_into(out: &mut [f32], qkv: &[f32], weight: &[f32], t: usize) {
                 dst[c] += qkv[centre + c];
             }
         });
-}
-
-/// Same-binary rollback switch for the FSMN loop-nest swap. Both settings are
-/// bit-identical — `_scratch` runs diff the full `SVS_TRACE` output — so this
-/// exists only for paired A/B timing.
-fn fsmn_flat() -> bool {
-    static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAT.get_or_init(|| std::env::var("SVS_FSMN_FLAT").map_or(true, |v| v != "0"))
-}
-
-/// Vocab tile width for the fused CTC projection + argmax.
-///
-/// `SVS_CTC_TILE=<n>` picks the width; `0` restores the monolithic t × VOCAB
-/// logits buffer as the same-binary rollback. Both are bit-identical — k = 512
-/// is one `kc` block at any width, so the per-logit reduction is unchanged and
-/// the bias fold only reorders an addition — and the `SVS_TRACE` gate diffs the
-/// two settings against each other. The default is 2048 (12 MB of tile at
-/// t = 1504): a width sweep on 90s_en was monotone from 2048 to 16384 and
-/// 2048 won 4/6 paired runs against 4096.
-fn ctc_tile() -> usize {
-    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let w = *W.get_or_init(|| {
-        std::env::var("SVS_CTC_TILE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048)
-    });
-    if w == 0 {
-        VOCAB
-    } else {
-        w.min(VOCAB)
-    }
 }
 
 fn layer_norm(y: &mut [f32], x: &[f32], w: &[f32], b: &[f32], d: usize) {
@@ -532,47 +501,6 @@ fn softmax(row: &mut [f32]) {
     }
 }
 
-/// How many work chunks the `gemm` crate splits each GEMM into.
-///
-/// The default is two chunks per rayon thread rather than one. On a
-/// heterogeneous CPU (here 8 P-cores + 12 E-cores) one chunk per thread leaves
-/// every core holding exactly one chunk, so the slow E-cores dictate the finish
-/// and the P-cores idle. Two each lets the P-cores steal the extra work.
-/// Paired A/B on 90s_en, 6 interleaved rounds: 1145 ms vs 1223 ms, and the
-/// faster setting won every one of the 6 pairs.
-///
-/// Only `m`/`n` are ever split, never `k`, so the f32 reduction order — and
-/// therefore every output bit — is unchanged (verified against the 77-line
-/// `SVS_TRACE` gate at 0 / 40 / 48). `SVS_GEMM_THREADS` overrides the default;
-/// `0` asks for the crate's own "one per thread" behaviour. `_scratch/gbench
-/// thr` sweeps the value.
-fn gemm_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        // An empty value must count as "unset": shells make it easy to export a
-        // variable as `""`, and `"".parse()` failing into `unwrap_or(0)` would
-        // silently pick the crate default instead of the tuned one.
-        std::env::var("SVS_GEMM_THREADS")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| 2 * rayon::current_num_threads())
-    })
-}
-
-/// Same-binary rollback switch for the bias-folding experiment.
-///
-/// `SVS_BIAS_FOLD=1` (default) folds each bias into an elementwise pass that
-/// had to run anyway; `SVS_BIAS_FOLD=0` falls back to the reference path of
-/// pre-filling `dst` and letting the GEMM accumulate onto it. Both are
-/// bit-identical (`_scratch/gbench bits`), so flipping this is a pure
-/// performance A/B — and it lets a paired comparison run against one binary
-/// instead of two builds on a machine whose timings drift 10% between runs.
-fn bias_fold() -> bool {
-    static FOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOLD.get_or_init(|| std::env::var("SVS_BIAS_FOLD").map_or(true, |v| v != "0"))
-}
-
 /// Freeze the `gemm` crate's tiling parameters before the first real GEMM.
 ///
 /// `gemm` derives `kc` — the k-blocking that decides the f32 accumulation
@@ -594,7 +522,7 @@ fn bias_fold() -> bool {
 /// `SVS_GEMM_CACHE=min` selects the E-core parameters, `off` leaves the coin
 /// flip in place for A/B comparisons.
 fn freeze_gemm_tiling() {
-    let mode = std::env::var("SVS_GEMM_CACHE").ok().filter(|v| !v.is_empty());
+    let mode = tuning::gemm_cache_mode();
     let saved = if mode.as_deref() == Some("off") {
         0
     } else {
@@ -604,7 +532,7 @@ fn freeze_gemm_tiling() {
     // the thread sits on the chosen core.
     let info = *gemm_common::cache::CACHE_INFO;
     unpin(saved);
-    if std::env::var("SVS_TRACE").ok().as_deref() == Some("1") {
+    if tuning::trace() {
         // Part of the bit gate: the same buffers can only be expected once the
         // tiling regime is the same, so record it in the trace.
         eprintln!(
@@ -613,95 +541,6 @@ fn freeze_gemm_tiling() {
             info[1].cache_bytes, info[2].cache_bytes,
         );
     }
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
-mod win_affinity {
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn GetCurrentThread() -> *mut core::ffi::c_void;
-        pub fn SetThreadAffinityMask(thread: *mut core::ffi::c_void, mask: usize) -> usize;
-    }
-}
-
-/// Pin to the logical processor with the extreme L1d size (`prefer_small` picks
-/// the minimum, otherwise the maximum) and return the previous affinity mask so
-/// the caller can restore it. 0 = nothing to restore.
-#[cfg(all(windows, target_arch = "x86_64"))]
-fn pin_to_l1_extreme(prefer_small: bool) -> usize {
-    use win_affinity as w;
-    // SAFETY: GetCurrentThread returns a pseudo-handle; SetThreadAffinityMask
-    // either rejects the mask (0) or applies it and returns the previous one.
-    unsafe {
-        let me = w::GetCurrentThread();
-        let mut saved = 0usize;
-        let mut best: Option<(usize, u64)> = None;
-        for lp in 0..64usize {
-            let prev = w::SetThreadAffinityMask(me, 1usize << lp);
-            if prev == 0 {
-                continue;
-            }
-            if saved == 0 {
-                saved = prev;
-            }
-            let Some(size) = l1d_bytes() else { continue };
-            if best.map_or(true, |(_, b)| {
-                if prefer_small {
-                    size < b
-                } else {
-                    size > b
-                }
-            }) {
-                best = Some((lp, size));
-            }
-        }
-        if let Some((lp, _)) = best {
-            w::SetThreadAffinityMask(me, 1usize << lp);
-        }
-        saved
-    }
-}
-
-#[cfg(not(all(windows, target_arch = "x86_64")))]
-fn pin_to_l1_extreme(_prefer_small: bool) -> usize {
-    0
-}
-
-fn unpin(saved: usize) {
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    if saved != 0 {
-        // SAFETY: `saved` is a mask this thread held before (see above).
-        unsafe {
-            win_affinity::SetThreadAffinityMask(win_affinity::GetCurrentThread(), saved);
-        }
-    }
-    #[cfg(not(all(windows, target_arch = "x86_64")))]
-    let _ = saved;
-}
-
-/// L1 data cache size of the core this thread is currently running on, from
-/// CPUID leaf 4 — the same leaf `gemm` reads. `None` if leaf 4 says nothing.
-#[cfg(all(windows, target_arch = "x86_64"))]
-fn l1d_bytes() -> Option<u64> {
-    for sub in 0..16u32 {
-        // CPUID is always available on x86_64, and `__cpuid_count` is a safe
-        // intrinsic there since Rust 1.87.
-        let r = std::arch::x86_64::__cpuid_count(4, sub);
-        let cache_type = r.eax & 0x1f;
-        if cache_type == 0 {
-            break;
-        }
-        let level = (r.eax >> 5) & 0x7;
-        // 1 = data, 2 = unified. Skip the instruction cache.
-        if level == 1 && (cache_type == 1 || cache_type == 2) {
-            let line = u64::from(r.ebx & 0xfff) + 1;
-            let parts = u64::from((r.ebx >> 12) & 0x3ff) + 1;
-            let ways = u64::from((r.ebx >> 22) & 0x3ff) + 1;
-            let sets = u64::from(r.ecx) + 1;
-            return Some(line * parts * ways * sets);
-        }
-    }
-    None
 }
 
 /// Broadcast `bias` across every output row. Isolated so the profiler can see
@@ -815,14 +654,14 @@ unsafe fn gemm_f32(
             false,
             false,
             false,
-            Parallelism::Rayon(gemm_threads()),
+            Parallelism::Rayon(tuning::gemm_threads()),
         );
     }
 }
 
 #[allow(dead_code)]
 fn trace(name: &str, x: &[f32]) {
-    if std::env::var("SVS_TRACE").ok().as_deref() == Some("1") {
+    if tuning::trace() {
         trace_on(name, x);
     }
 }
@@ -831,7 +670,7 @@ fn trace(name: &str, x: &[f32]) {
 /// difference down to the stage that first produces it.
 #[allow(dead_code)]
 fn trace_f(name: &str, x: &[f32]) {
-    if std::env::var("SVS_TRACE_FINE").ok().as_deref() == Some("1") {
+    if tuning::trace_fine() {
         trace_on(name, x);
     }
 }

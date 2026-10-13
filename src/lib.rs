@@ -6,6 +6,7 @@
 //! whole clip.
 
 mod audio;
+mod cpu_affinity;
 mod ctc;
 mod encoder_cpu;
 mod encoder_gpu;
@@ -16,6 +17,7 @@ mod pt;
 mod postprocess;
 mod shaders;
 mod tokenizer;
+mod tuning;
 mod vad;
 mod weights;
 

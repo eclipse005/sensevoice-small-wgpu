@@ -13,6 +13,7 @@ use crate::ctc::{greedy, VOCAB};
 use crate::gemm_f32::{gemm_f32, gemm_f32_bias, GEMM_BM, GEMM_BN};
 use crate::gpu::Gpu;
 use crate::shaders;
+use crate::tuning;
 use crate::weights::{Weights, CTC_PAD, FFN, HIDDEN, QKV};
 
 // The GEMM tile edge drives every GEMM dispatch, so it must track the shader's
@@ -325,14 +326,11 @@ impl GpuEngine {
         let ids = self.acts.as_ref().unwrap().ids.clone();
         self.gpu.write_at(&in560, 0, &bytes);
         let (ops, blob) = self.record(pad, t, ban)?;
-        if std::env::var("SVS_GPU_DUMP_OPS").ok().as_deref() == Some("1") {
+        if tuning::gpu_dump_ops() {
             Self::dump_ops(&ops, pad, t);
         }
         self.gpu.write_at(&self.uni, 0, &blob);
-        let stop = std::env::var("SVS_GPU_STOP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(usize::MAX);
+        let stop = tuning::gpu_stop();
         let run = ops.len().min(stop);
         let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Windows TDR resets the device when one submission keeps the GPU busy
@@ -344,17 +342,13 @@ impl GpuEngine {
         // t=3004 in one submission already trips the watchdog). This targets
         // roughly 1.1 s of GPU work per submission; the wait between batches
         // costs about 1% of the encode, so this is not a throughput trade.
-        let chunk = std::env::var("SVS_GPU_CHUNK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|c| *c > 0)
-            .unwrap_or_else(|| (1_400_000 / t.max(1)).clamp(16, 2048));
+        let chunk = tuning::gpu_chunk().unwrap_or_else(|| (1_400_000 / t.max(1)).clamp(16, 2048));
         // Per-dispatch timing is a diagnostic build path: it needs one compute
         // pass per dispatch, so it only runs under `SVS_GPU_PROF=1`.
-        let prof = std::env::var("SVS_GPU_PROF").ok().as_deref() == Some("1")
+        let prof = tuning::gpu_prof()
             && self.gpu.features.contains(wgpu::Features::TIMESTAMP_QUERY)
             && run * 2 <= 4096;
-        if std::env::var("SVS_GPU_PROF").ok().as_deref() == Some("1") && !prof {
+        if tuning::gpu_prof() && !prof {
             eprintln!("gpu prof: 不可用（缺 TIMESTAMP_QUERY 或 op 数超限）");
         }
         let qset = prof.then(|| {
@@ -419,7 +413,7 @@ impl GpuEngine {
         for c in raw.chunks_exact(4) {
             frames.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
-        if std::env::var("SVS_GPU_DEBUG").ok().as_deref() == Some("1") {
+        if tuning::gpu_debug() {
             self.dump_debug(x, pad, t, ops.len(), &frames)?;
         }
         Ok(greedy(&frames))
