@@ -10,7 +10,7 @@
 use gemm::{gemm, Parallelism};
 use rayon::prelude::*;
 
-use crate::ctc::{argmax_rows, greedy, VOCAB};
+use crate::ctc::{argmax_tile, greedy, VOCAB};
 use crate::weights::{Layer, Weights, HIDDEN, QKV};
 
 const EPS: f32 = 1e-5;
@@ -179,10 +179,24 @@ impl CpuEngine {
         }
         tprof!(prof, ln2, layer_norm_inplace(&mut cur, &self.weights.tp_w, &self.weights.tp_b, HIDDEN));
         trace("tp_norm", &cur);
-        let mut logits = vec![0f32; t * VOCAB];
-        tprof!(prof, w2, linear_into(&mut logits, &cur, &self.weights.ctc.w, &self.weights.ctc.b, t, HIDDEN, VOCAB));
-        trace("logits", &logits);
-        let frames = tprof!(prof, tail, argmax_rows(&logits, t, VOCAB, ban));
+        // CTC projection and argmax fused over vocab tiles. Materialising the
+        // full t × VOCAB logits costs 151 MB at t = 1504 to feed what is only a
+        // row-wise argmax; here one tile lives at a time and its bias enters the
+        // comparison directly. Bit-identical to the old path: k = 512 is a
+        // single `kc` block at any tile width, so each logit is the same
+        // product-sum, and `acc + b` is the same float the old `b + acc`
+        // produced — verified against the monolithic setting by the trace gate.
+        let tile_w = ctc_tile();
+        let mut tile = vec![0f32; t * tile_w];
+        let mut best_v = vec![f32::NEG_INFINITY; t];
+        let mut frames = vec![0i32; t];
+        for j0 in (0..VOCAB).step_by(tile_w) {
+            let w = tile_w.min(VOCAB - j0);
+            let dst = &mut tile[..t * w];
+            tprof!(prof, w2, linear_gemm(dst, &cur, &self.weights.ctc.w[j0 * HIDDEN..(j0 + w) * HIDDEN], t, HIDDEN, w));
+            tprof!(prof, tail, argmax_tile(dst, w, j0, &self.weights.ctc.b, ban, &mut best_v, &mut frames));
+        }
+        trace("ctc_best", &best_v);
         greedy(&frames)
     }
 
@@ -433,6 +447,31 @@ fn fsmn_into(out: &mut [f32], qkv: &[f32], weight: &[f32], t: usize) {
 fn fsmn_flat() -> bool {
     static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAT.get_or_init(|| std::env::var("SVS_FSMN_FLAT").map_or(true, |v| v != "0"))
+}
+
+/// Vocab tile width for the fused CTC projection + argmax.
+///
+/// `SVS_CTC_TILE=<n>` picks the width; `0` restores the monolithic t × VOCAB
+/// logits buffer as the same-binary rollback. Both are bit-identical — k = 512
+/// is one `kc` block at any width, so the per-logit reduction is unchanged and
+/// the bias fold only reorders an addition — and the `SVS_TRACE` gate diffs the
+/// two settings against each other. The default is 2048 (12 MB of tile at
+/// t = 1504): a width sweep on 90s_en was monotone from 2048 to 16384 and
+/// 2048 won 4/6 paired runs against 4096.
+fn ctc_tile() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let w = *W.get_or_init(|| {
+        std::env::var("SVS_CTC_TILE")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048)
+    });
+    if w == 0 {
+        VOCAB
+    } else {
+        w.min(VOCAB)
+    }
 }
 
 fn layer_norm(y: &mut [f32], x: &[f32], w: &[f32], b: &[f32], t: usize, d: usize) {
@@ -819,4 +858,56 @@ fn trace_on(name: &str, x: &[f32]) {
     // gate is only meaningful if it can see exactly that. `{:.9}` on a 1e6
     // magnitude is the whole f64 mantissa; on `max` it is the whole f32 one.
     eprintln!("trace {name} sum={sum:.9} max={max:.9} n={} h={h:016x}", x.len());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vocab-tiled CTC path must reproduce the monolithic one bit for bit:
+    /// same logits, same winners. This is the byte gate for `ctc_tile`.
+    #[test]
+    fn ctc_tiling_is_bit_identical() {
+        let t = 7;
+        let mut cur = vec![0f32; t * HIDDEN];
+        let mut w = vec![0f32; VOCAB * HIDDEN];
+        let mut b = vec![0f32; VOCAB];
+        let mut state = 0x1234_5678u32;
+        for x in cur.iter_mut().chain(w.iter_mut()).chain(b.iter_mut()) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *x = (state >> 8) as f32 / 16777216.0 - 0.5;
+        }
+
+        // Monolithic reference: bias pre-filled, GEMM accumulates onto it.
+        let mut logits = vec![0f32; t * VOCAB];
+        linear_into(&mut logits, &cur, &w, &b, t, HIDDEN, VOCAB);
+
+        // Tiled path, exactly as `encode_inner` runs it.
+        let tile_w = 4096usize;
+        let mut tile = vec![0f32; t * tile_w];
+        let mut best_v = vec![f32::NEG_INFINITY; t];
+        let mut frames = vec![0i32; t];
+        for j0 in (0..VOCAB).step_by(tile_w) {
+            let cw = tile_w.min(VOCAB - j0);
+            let dst = &mut tile[..t * cw];
+            linear_gemm(dst, &cur, &w[j0 * HIDDEN..(j0 + cw) * HIDDEN], t, HIDDEN, cw);
+            for r in 0..t {
+                for j in 0..cw {
+                    let mono = logits[r * VOCAB + j0 + j].to_bits();
+                    let fold = (dst[r * cw + j] + b[j0 + j]).to_bits();
+                    assert_eq!(mono, fold, "logit row {r} col {}", j0 + j);
+                }
+            }
+            argmax_tile(dst, cw, j0, &b, None, &mut best_v, &mut frames);
+        }
+
+        let zeros = vec![0.0f32; VOCAB];
+        let mut ref_v = vec![f32::NEG_INFINITY; t];
+        let mut ref_f = vec![0i32; t];
+        argmax_tile(&logits, VOCAB, 0, &zeros, None, &mut ref_v, &mut ref_f);
+        assert_eq!(frames, ref_f);
+        for (a, bv) in ref_v.iter().zip(best_v.iter()) {
+            assert_eq!(a.to_bits(), bv.to_bits());
+        }
+    }
 }
