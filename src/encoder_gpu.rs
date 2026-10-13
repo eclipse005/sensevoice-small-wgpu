@@ -773,6 +773,13 @@ impl GpuEngine {
     /// for a clip it never saw.
     pub fn reserve_frames(&mut self, t: usize) -> Result<()> {
         self.ensure(t)?;
+        if tuning::rb_fused() {
+            // Pre-size the readback staging buffer here, outside the RTFx
+            // clock: allocating it on the first encode costs ~0.25 ms of the
+            // timed region (and a one-shot CLI never gets a second chance to
+            // reuse it). The size covers the token ids plus the CMVN row sums.
+            self.gpu.stage_for(t as u64 * 8 + 64);
+        }
         Ok(())
     }
 

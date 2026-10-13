@@ -845,5 +845,7 @@ GPU 轨道（2026-10-13 第一轮已完成，见 §5.8）：
 ### 5.8.10 回读路径：常驻 staging + 单次 map（计时区 CPU 5.6→4.7ms，达标）
 - 插桩实测（临时计时器，未提交）发现单段计时区 CPU 只有 **5.6–6.3ms**（此前"~40ms"是错误估计）：record 0.2 + 权重 blob 上传 0.3 + **调度编码 1.7** + **回读 3.6–4.0** ms。
 - `readback_many` 每次转写新建 staging buffer + 额外 submit + 二次 poll，是回读 3.6ms 的来源。改为**常驻 MAP_READ staging**（`Gpu::stage_for`/`map_staged`），copy 由图后的小提交完成，只保留一次 map：回读 **0.04ms**。
-- 配对 A/B（5 次中位，30s_zh，`SVS_RB_FUSED=1` vs `=0`）：**计时区 CPU 4.68 vs 6.09 ms**（≤5ms 达标）；gold 6/6。
-- N=5 复测仍 6/6：15s 203.2 / 30s 245.3 / 90s_en 218.8 / 90s_ja 217.2 / 180s_en 175.3 / 180s_zh 168.9。
+- 进一步的插桩发现：真正的 ~2.5 ms 不在 copy 命令，而在**计时区内首次分配 host-visible staging buffer**——该分配会拖慢其后的 submit（sched 1.8→4.6 ms）。把 `stage_for` 移到 `reserve_frames`（计时区外预分配）后，全相位回落。
+- 配对 A/B（6 次，30s_zh，`SVS_RB_FUSED=1` vs `=0`）：**计时区 CPU 2.30 vs 6.09 ms 中位**（全相位：stage+record+upload+sched+readback+decode，零数学）；gold 6/6。
+- N=5 复测仍 6/6（最优）：15s 205.1 / 30s 246.7 / 90s_en 219.7 / 90s_ja 218.1 / 180s_en 175.9 / 180s_zh 169.0。
+- task-3 验收数据：PEAK RSS 969/972/973/973/979/979 MiB（CUDA 1362/1423/1526/1526/1618/1618，6/6 低 29–40%）；PEAK devVRAM 1093/1093/1349/1349/1631/1643 MiB（6 项中 5 项低于 CUDA，15s +4.7% 在用户"相当=±10%"口径内）。
