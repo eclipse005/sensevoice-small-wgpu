@@ -623,6 +623,7 @@ impl GpuEngine {
     pub fn encode(&mut self, t: usize, n_lfr: usize, ban: Option<usize>) -> Result<(Vec<i32>, f32)> {
         let pad = self.ensure(t)?;
         let ids = self.acts.as_ref().unwrap().ids.clone();
+        let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
         let (ops, blob) = self.record(pad, t, ban)?;
         if tuning::gpu_dump_ops() {
             Self::dump_ops(&ops, pad, t);
@@ -630,6 +631,11 @@ impl GpuEngine {
         self.gpu.write_at(&self.uni, 0, &blob);
         let stop = tuning::gpu_stop();
         let run = ops.len().min(stop);
+        // Transcript readback: one reused staging buffer whose copies ride the
+        // graph's last submission, so no extra queue sync is needed.
+        let id_bytes = (t * 4) as u64;
+        let sum_bytes = (((n_lfr * 4) as u64) + 3) & !3;
+        let stage = tuning::rb_fused().then(|| self.gpu.stage_for(id_bytes + sum_bytes));
         let guard = self.gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Windows TDR resets the device when one submission keeps the GPU busy
         // past ~2 s. A lost device silently turns every later dispatch into a
@@ -697,6 +703,15 @@ impl GpuEngine {
             self.gpu.queue.submit([enc.finish()]);
             i = end;
         }
+        // The readback copies ride their own small submission right after the
+        // graph, so the transcript only needs one map (no second buffer
+        // allocation, no second sync) once the queue drains.
+        if let Some(st) = stage.as_ref() {
+            let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(&ids, 0, st, 0, id_bytes);
+            enc.copy_buffer_to_buffer(&row_sums, 0, st, id_bytes, sum_bytes);
+            self.gpu.queue.submit([enc.finish()]);
+        }
         // Single wait for the whole graph (see the batching comment above).
         self.gpu
             .device
@@ -707,10 +722,12 @@ impl GpuEngine {
         }
         // One map serves both readbacks: the token ids and the frontend's
         // per-row CMVN sums (the `feat_sum` diagnostic).
-        let row_sums = self.acts.as_ref().unwrap().row_sums.clone();
-        let raw = self
-            .gpu
-            .readback_many(&[(&ids, (t * 4) as u64), (&row_sums, (n_lfr * 4) as u64)])?;
+        let raw = match stage.as_ref() {
+            Some(st) => self.gpu.map_staged(st, id_bytes + sum_bytes)?,
+            None => self
+                .gpu
+                .readback_many(&[(&ids, id_bytes), (&row_sums, (n_lfr * 4) as u64)])?,
+        };
         let (id_bytes, sum_bytes) = raw.split_at(t * 4);
         let mut feat_sum = 0.0f32;
         for c in sum_bytes.chunks_exact(4) {

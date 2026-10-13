@@ -11,6 +11,10 @@ pub struct Gpu {
     /// queue drains, and a per-call counter lets the small per-tensor writes
     /// accumulate the whole model (~900 MiB) before anything is polled.
     pending: std::cell::Cell<usize>,
+    /// Reused MAP_READ staging buffer for the per-utterance transcript
+    /// readback: a fresh buffer per call cost an allocation plus a second
+    /// queue round-trip on every encode.
+    stage: std::cell::RefCell<Option<wgpu::Buffer>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -288,6 +292,7 @@ impl Gpu {
             limits,
             features: feats,
             pending: std::cell::Cell::new(0),
+            stage: std::cell::RefCell::new(None),
         })
     }
 
@@ -391,6 +396,43 @@ impl Gpu {
         let out = data[..bytes as usize].to_vec();
         drop(data);
         staging.unmap();
+        Ok(out)
+    }
+
+    /// Size the reusable readback staging buffer for `size` bytes and return
+    /// it. The buffer grows to the largest clip seen and is mapped/unmapped per
+    /// utterance by [`Self::map_staged`].
+    pub fn stage_for(&self, size: u64) -> wgpu::Buffer {
+        let need = size.max(4);
+        let mut slot = self.stage.borrow_mut();
+        if !slot.as_ref().map(|b| b.size() >= need).unwrap_or(false) {
+            *slot = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback-stage"),
+                size: need,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        slot.clone().unwrap()
+    }
+
+    /// Map the first `size` bytes of `buf` (already filled by the graph's last
+    /// submission) and copy them out. The caller must [`wgpu::Buffer::unmap`]
+    /// ... which this does before returning.
+    pub fn map_staged(&self, buf: &wgpu::Buffer, size: u64) -> Result<Vec<u8>> {
+        let slice = buf.slice(..size.max(4));
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll stage")?;
+        rx.recv().context("map callback")?.context("map buffer")?;
+        let data = slice.get_mapped_range()?;
+        let out = data.to_vec();
+        drop(data);
+        buf.unmap();
         Ok(out)
     }
 

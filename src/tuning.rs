@@ -119,6 +119,14 @@ pub fn tile_wide() -> bool {
     *W.get_or_init(|| std::env::var("SVS_TILE_WIDE").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_RB_FUSED=0` reads the transcript back through the one-shot
+/// `readback_many` path (fresh staging buffer, extra queue sync) instead of the
+/// reused staging buffer whose copies ride the graph's last submission.
+pub fn rb_fused() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_RB_FUSED").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_FSMN_TAP=0` uses the checkpoint's `[512][11]` weight layout instead of
 /// the host-transposed tap-major copy.
 pub fn fsmn_tap() -> bool {
