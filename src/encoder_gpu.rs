@@ -574,6 +574,38 @@ impl GpuEngine {
                 op.slot
             );
         }
+
+        // Same-class ops can have very different shapes (gemm_b is qkv at
+        // N=1536, w1 at N=2048 and the CTC head at N=25088), so a class total
+        // hides which shape is actually slow. Aggregate by dispatch shape.
+        let mut by_shape: Vec<((&'static str, u32, u32, u32), usize, u64)> = Vec::new();
+        for (k, op) in ops.iter().enumerate() {
+            let d = ts[2 * k + 1].saturating_sub(ts[2 * k]);
+            let key = (pid_name(op.pipe), op.x, op.y, op.z);
+            match by_shape.iter_mut().find(|(ks, ..)| *ks == key) {
+                Some(e) => {
+                    e.1 += 1;
+                    e.2 += d;
+                }
+                None => by_shape.push((key, 1, d)),
+            }
+        }
+        by_shape.sort_by_key(|e| std::cmp::Reverse(e.2));
+        eprintln!("gpu prof: 按形状聚合（Top 20）");
+        for ((name, x, y, z), cnt, ns) in by_shape.iter().take(20) {
+            let mean = *ns as f64 / 1e6 / (*cnt as f64);
+            eprintln!(
+                "  {:<10} ({:>3},{:>3},{:>1}) x{:<3} {:>9.3} ms  avg {:>7.3} ms  {:>5.1}%",
+                name,
+                x,
+                y,
+                z,
+                cnt,
+                *ns as f64 / 1e6,
+                mean,
+                100.0 * *ns as f64 / tot
+            );
+        }
         Ok(())
     }
 

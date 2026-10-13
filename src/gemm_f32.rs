@@ -34,10 +34,17 @@ pub const GEMM_TY: usize = 8;
 pub const GEMM_BM: u32 = (GEMM_TY * GEMM_TM) as u32;
 pub const GEMM_BN: u32 = (GEMM_TX * GEMM_TN) as u32;
 
+/// B-slab row stride: `BN` plus padding. The slab is stored as `[BK][TN][TX]`
+/// (see `b_slot`), so a warp's B load reads `TX` consecutive floats and is
+/// conflict-free with no padding at all; the *store* pattern's `b * 16` offset
+/// aliases two bank groups, and four extra floats turn that from 8-way into
+/// 2-way. Pure layout — every thread reads back the same values it wrote.
+pub const GEMM_BNP: usize = GEMM_BN as usize + 4;
+
 /// Shared-memory bytes the double-buffered tile needs: two alternating
-/// `BM×BK` / `BN×BK` slab pairs.
+/// `BM×BK` / `BK×BNP` slab pairs.
 pub const GEMM_SMEM: u32 =
-    (2 * (GEMM_BM as usize + GEMM_BN as usize) * GEMM_BK * 4) as u32;
+    (2 * (GEMM_BM as usize * GEMM_BK + GEMM_BK * GEMM_BNP) * 4) as u32;
 
 fn reps(total: usize, threads: usize) -> usize {
     total.div_ceil(threads)
@@ -81,7 +88,7 @@ pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
     let mut bv_load2 = String::new();
     for j in 0..GEMM_TN {
         bv_load2.push_str(&format!(
-            "        bv_{j} = Bs[bbase_off + ki * BN + tx * TN + {j}u];\n"
+            "        bv_{j} = Bs[bbase_off + ki * BNP + {j}u * TX + tx];\n"
         ));
     }
     let mut fma = String::new();
@@ -147,14 +154,17 @@ pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
             .map(|e| format!("        As[{off} + tid + {e}u * {nthr2}u] = ra{e};\n"))
             .collect()
     };
-    // The B slab is [BK][BN], i.e. row stride BN. Under the non-transposed
-    // (ki-fastest) load mapping the destination is ki*BN + col, which is NOT p;
-    // under the transposed mapping it happens to equal p.
+    // The B slab is [BK][TN][TX] with row stride BNP: element (ki, col) lives
+    // at `ki*BNP + (col % TN)*TX + col/TN`. The inner transpose is what makes a
+    // warp's B load (`bv_j`, lane tx, fixed j) read TX consecutive floats
+    // instead of a TN-wide stride, i.e. conflict-free. Under the non-transposed
+    // (ki-fastest) global load mapping the element is (ki = p % BK, col = p / BK);
+    // under the transposed mapping it is (ki = p / BN, col = p % BN).
     let b_slot = |p: &str| -> String {
         if transb {
-            format!("{p}")
+            format!("({p} / BN) * BNP + (({p} % BN) % TN) * TX + (({p} % BN) / TN)")
         } else {
-            format!("({p} % BK) * BN + ({p} / BK)")
+            format!("({p} % BK) * BNP + (({p} / BK) % TN) * TX + (({p} / BK) / TN)")
         }
     };
     let b_store = |off: &str| -> String {
@@ -209,10 +219,12 @@ const BN: u32 = {bn}u;
 const BK: u32 = {bk}u;
 const TM: u32 = {tm}u;
 const TN: u32 = {tn}u;
+const TX: u32 = {txn}u;
 const TRANSB: u32 = {trans}u;
 const BETA: u32 = {beta_s}u;
 const ASM: u32 = {asn}u;
 const BSM: u32 = {bsn}u;
+const BNP: u32 = {bnp}u;
 var<workgroup> As: array<f32, {as2n}>;
 var<workgroup> Bs: array<f32, {bs2n}>;
 
@@ -260,9 +272,10 @@ fn gemm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         tm = GEMM_TM,
         tn = GEMM_TN,
         asn = GEMM_BM as usize * GEMM_BK,
-        bsn = GEMM_BN as usize * GEMM_BK,
+        bsn = GEMM_BK * GEMM_BNP,
+        bnp = GEMM_BNP,
         as2n = 2 * GEMM_BM as usize * GEMM_BK,
-        bs2n = 2 * GEMM_BN as usize * GEMM_BK,
+        bs2n = 2 * GEMM_BK * GEMM_BNP,
         txn = GEMM_TX,
         tyn = GEMM_TY,
     )
