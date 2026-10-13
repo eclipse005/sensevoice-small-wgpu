@@ -634,13 +634,13 @@ impl GpuEngine {
         // Windows TDR resets the device when one submission keeps the GPU busy
         // past ~2 s. A lost device silently turns every later dispatch into a
         // no-op, leaving `ids` all zeros and the decode empty, so the graph is
-        // split into batches that are each waited on.
-        //
-        // Per-dispatch cost grows with `t` (measured ~0.95 ms at t=1504, and
-        // t=3004 in one submission already trips the watchdog). This targets
-        // roughly 1.1 s of GPU work per submission; the wait between batches
-        // costs about 1% of the encode, so this is not a throughput trade.
-        let chunk = tuning::gpu_chunk().unwrap_or_else(|| (1_400_000 / t.max(1)).clamp(16, 2048));
+        // split into batches (each well under the watchdog), but the batches
+        // are submitted back-to-back and waited on once at the end: the
+        // driver executes batch k while the CPU records batch k+1, which hides
+        // the record cost (~8 ms over 774 dispatches) behind the GPU instead
+        // of adding it in front.
+        let chunk = tuning::gpu_chunk()
+            .unwrap_or_else(|| (1_400_000 / t.max(1)).clamp(16, 2048).min(160));
         // Per-dispatch timing is a diagnostic build path: it needs one compute
         // pass per dispatch, so it only runs under `SVS_GPU_PROF=1`.
         let prof = tuning::gpu_prof()
@@ -695,11 +695,13 @@ impl GpuEngine {
                 }
             }
             self.gpu.queue.submit([enc.finish()]);
-            self.gpu
-                .device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .context("poll batch")?;            i = end;
+            i = end;
         }
+        // Single wait for the whole graph (see the batching comment above).
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("poll graph")?;
         if prof {
             self.dump_prof(&qset.unwrap(), &ops)?;
         }
