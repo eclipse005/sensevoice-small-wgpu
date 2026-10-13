@@ -1253,11 +1253,11 @@ fn push_gemm(
     // Output projections (N=512, short K) re-read A 8x and W 4x under the 64x64
 // tile; the 128x128 tile halves that and still has enough blocks (the model's
 // N is 512 on every fixture, M is 256..3000).
-    // N=512 projections take the 128x128 tile when they are short-K (outp) or
-    // long-M (w2 at 90s+): the 64x64 tile's A/W re-read amplification costs
-    // more than the extra blocks buy. At m<=512 (short clips) the 64x64 tile
-    // still wins for w2 by a wide margin (30s_zh: 237 vs 208 RTFx).
-    let wide_short_k = tuning::tile_wide() && n == 512 && (k <= 512 || m > 512);
+    // The N=512 projections (outp, w2) take the 128x128 tile only on long
+    // clips: their occupancy is the binding constraint, and at m<=512 the
+    // 128x128 tile leaves 16-48 of the 128 SMs idle. Measured at 30s_zh
+    // (outp 128x128 vs 64x64): 121.2 ms vs 118.0 ms encode.
+    let wide_short_k = tuning::tile_wide() && n == 512 && m > 512;
     let (pipe, bm, bn) = if tuning::tile_small() && (m <= 512 || n <= 512) && !wide_short_k {
         (
             match pipe {
