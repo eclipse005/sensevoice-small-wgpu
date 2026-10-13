@@ -36,7 +36,31 @@ fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
     workgroupBarrier();
     if (lane == 0u) {
         var mean = 0.0;
-        for (var c: u32 = 0u; c < dv; c = c + 1u) {
+        let full = dv / 4u;
+        for (var i: u32 = 0u; i < full; i = i + 1u) {
+            let c = i * 4u;
+            let v0 = tile[g * ROWQ + c];
+            let v1 = tile[g * ROWQ + c + 1u];
+            let v2 = tile[g * ROWQ + c + 2u];
+            let v3 = tile[g * ROWQ + c + 3u];
+            mean = mean + v0.x;
+            mean = mean + v0.y;
+            mean = mean + v0.z;
+            mean = mean + v0.w;
+            mean = mean + v1.x;
+            mean = mean + v1.y;
+            mean = mean + v1.z;
+            mean = mean + v1.w;
+            mean = mean + v2.x;
+            mean = mean + v2.y;
+            mean = mean + v2.z;
+            mean = mean + v2.w;
+            mean = mean + v3.x;
+            mean = mean + v3.y;
+            mean = mean + v3.z;
+            mean = mean + v3.w;
+        }
+        for (var c: u32 = full * 4u; c < dv; c = c + 1u) {
             let v = tile[g * ROWQ + c];
             mean = mean + v.x;
             mean = mean + v.y;
@@ -49,7 +73,31 @@ fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
     let mean = stats[g * 2u];
     if (lane == 0u) {
         var var_ = 0.0;
-        for (var c: u32 = 0u; c < dv; c = c + 1u) {
+        let full = dv / 4u;
+        for (var i: u32 = 0u; i < full; i = i + 1u) {
+            let c = i * 4u;
+            let z0 = tile[g * ROWQ + c] - vec4<f32>(mean);
+            let z1 = tile[g * ROWQ + c + 1u] - vec4<f32>(mean);
+            let z2 = tile[g * ROWQ + c + 2u] - vec4<f32>(mean);
+            let z3 = tile[g * ROWQ + c + 3u] - vec4<f32>(mean);
+            var_ = var_ + z0.x * z0.x;
+            var_ = var_ + z0.y * z0.y;
+            var_ = var_ + z0.z * z0.z;
+            var_ = var_ + z0.w * z0.w;
+            var_ = var_ + z1.x * z1.x;
+            var_ = var_ + z1.y * z1.y;
+            var_ = var_ + z1.z * z1.z;
+            var_ = var_ + z1.w * z1.w;
+            var_ = var_ + z2.x * z2.x;
+            var_ = var_ + z2.y * z2.y;
+            var_ = var_ + z2.z * z2.z;
+            var_ = var_ + z2.w * z2.w;
+            var_ = var_ + z3.x * z3.x;
+            var_ = var_ + z3.y * z3.y;
+            var_ = var_ + z3.z * z3.z;
+            var_ = var_ + z3.w * z3.w;
+        }
+        for (var c: u32 = full * 4u; c < dv; c = c + 1u) {
             let z = tile[g * ROWQ + c] - vec4<f32>(mean);
             var_ = var_ + z.x * z.x;
             var_ = var_ + z.y * z.y;
