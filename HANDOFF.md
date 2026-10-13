@@ -4,9 +4,8 @@
 > 交接人：mavis（被用户中断，交由下一个 AI 接手）
 > 文档目的：让接手者无需重读全部历史即可继续推进。
 >
-> **2026-10-13 更新**：CPU 路径优化已闭环（确定性修复 + 2 项位级等价优化，
-> RTFx 全面提升，详见 §4.4–4.8），代码已入本地 git（3 个提交）。
-> GPU 剖面轨道（§5）暂缓，状态已同步。**工作区真相源是代码，本文档仅次之。**
+> **2026-10-13 更新（下半场）**：GPU 逐 op 剖面**已跑通**（§5），结论是
+> GEMM 家族占 GPU busy 的 **83.7%**，方向定为深挖 GEMM。代码已入本地 git（5 个提交）。
 
 ---
 
@@ -22,12 +21,13 @@
 - **CPU RTFx 全面提升**（90s_en 61.4 → **86.6**，+41%），全部优化**位级等价**，
   6/6 gold 通过，逐项有同二进制回退开关。
 - **代码已入本地 git**：`0be4b36` 初始 → `32cc464` FSMN → `a6f068c` CTC，工作区干净。
-- **GPU 剖面轨道（§5）暂缓**：QUERY_RESOLVE 修复**已编译进当前 exe**（见 §5.4），
-  只差跑一次 `SVS_GPU_PROF=1` 验证时间戳。
+- **GPU 剖面（§5）已跑通**：真实卡点是 `MAP_READ` 不能与 `QUERY_RESOLVE` 同 buffer
+  （交接文档里写的单 buffer 修复方案不合 wgpu 校验）。已改为 resolve+staging 两段式并验证。
+  剖面结论：GEMM 家族 83.7%，非 GEMM 16.3%，下一步深挖 GEMM。
 - 用户已拍板：**softmax exp 向量化暂不做**（非位级等价，数值高风险，2026-10-13）。
 
 **GPU 轨道既有状态**（2026-10-12）：GPU 路径已稳定通过 6/6 对齐，RTFx 已达原版 CUDA 的
-0.5–3.6 倍、原版 CPU 的 3–6 倍。"逐 op GPU 时间戳剖面"卡点已解除（修复已编译），待验证。
+0.5–3.6 倍、原版 CPU 的 3–6 倍。
 
 ---
 
@@ -331,24 +331,26 @@ L0 与旧基线逐位一致，零数学改动）。
 prof 路径跑 90s_en：`encode_ms: 650.303 / rtfx: 124.20 / tokens: 310 / gold: 一致 / exit=0`。
 → **每个 dispatch 独立 pass 没有引入可观测开销（650.30 vs 常规 650.34），且结果逐 token 一致。**
 
-### 5.4 当前卡点（**已解除：修复已在源码且已编译，只差验证**）
+### 5.4 卡点定位过程（**已解决，2026-10-13**）
 
-首次 prof 运行：984 dispatch 分类完全正确，但**时间戳全为 0**，且末尾报
-`GPU 校验失败: Validation Error`。根因：
+首次 prof 运行报的两个 wgpu 校验错误，按顺序出现，第二个才是真卡点：
 
-```
-In a CommandEncoder
-  Error encountered while trying to resolve a query
-    Usage flags BufferUsages(MAP_READ | COPY_DST) of Buffer with 'prof-resolve'
-    label do not contain required usage flags BufferUsages(QUERY_RESOLVE)
-```
+1. `MAP_READ | COPY_DST` 的 buffer 不接受 `resolve_query_set`（缺 `QUERY_RESOLVE`）。
+2. 只补 `QUERY_RESOLVE` 后**新的**报错：
+   ```
+   In Device::create_buffer, label = 'prof-resolve'
+     `MAP` usage can only be combined with the opposite `COPY`,
+     requested BufferUsages(MAP_READ | COPY_DST | QUERY_RESOLVE)
+   ```
+   wgpu 规定 mappable buffer 只能与相反的 COPY 搭配，不能和 `QUERY_RESOLVE` 共存。
 
-**修复已写入源码**（`src\encoder_gpu.rs:571`，给 prof staging buffer 加
-`wgpu::BufferUsages::QUERY_RESOLVE`）。**2026-10-13 核实：修复在源码中，
-且当前 exe（2026-10-13 09:51 构建）晚于 `encoder_gpu.rs`（10-12 20:47），
-即修复已编译进 exe**。尚未重新跑 `SVS_GPU_PROF=1` 验证时间戳。
+**正确修法（已提交 `79fe2ed`）**：两段式，与 `Gpu::readback` 同模式——
+`prof-resolve` = `QUERY_RESOLVE | COPY_SRC`，`prof-staging` = `MAP_READ | COPY_DST`，
+encode 里 `resolve_query_set` 后接 `copy_buffer_to_buffer`。
 
-### 5.5 回到 GPU 轨道的第一步（照做即可；`cargo build` 已非必需，跑了无害）
+验证：`SVS_GPU_PROF=1` 90s_en → 984 dispatch 分类正确、时间戳非零、exit=0、tokens=310。
+
+### 5.5 复现剖面的命令（已验证跑通）
 
 ```powershell
 cd D:\SenseVoiceSmall\SenseVoiceSmall-wgpu
@@ -379,9 +381,25 @@ gpu prof: 最慢 10 个 dispatch
   ...
 ```
 
-### 5.6 已知的 op 普查（结构，不含时间）
+### 5.6 剖面实测（2026-10-13，90s_en，P104；**机器有 GPU 争用**，看相对份额，绝对值待静默复测）
 
-共 984 个 dispatch = 70 层 × 14 op + after_norm/tp_norm/ctc/arg：
+`gpu prof: 984 dispatches, GPU busy 837.853 ms`：
+
+| op | 次数 | ms | 份额 | | op | 次数 | ms | 份额 |
+|---|---|---|---|---|---|---|---|---|
+| **gemm_b** | 141 | 262.96 | **31.4%** | | soft | 70 | 47.88 | 5.7% |
+| **gemm_f32c** | 140 | 203.12 | **24.2%** | | ln_f16 | 140 | 40.98 | 4.9% |
+| **gemm** | 70 | 126.54 | **15.1%** | | fsmn | 70 | 11.96 | 1.4% |
+| **gemm_nt** | 70 | 108.30 | **12.9%** | | split/relu/add/merge/ln/arg/ln_f32 | 353 | 38.2 | 4.6% |
+
+- **GEMM 家族合计 700.9 ms = 83.7%**；非 GEMM 16.3%（其中 soft + ln_f16 占 10.6%）。
+- 最慢单个 dispatch：`#982 gemm_b (196,12,1)` **19.73 ms** —— 即 CTC 头投影
+  （t=1504 × 512 → vocab≈25055），一项占总量 2.4%，可作为独立优化对象。
+- 其余 GEMM 单次均值 1.45–1.81 ms，70×2 层量级相近。
+- prof 路径逐 dispatch 一个 compute pass，端到端 encode 比常规慢约 12%（955 vs ~830 ms），
+  **份额可信、绝对值偏大**；GPU busy 总和也含 pass 间气泡。
+
+### 5.6.1 op 普查（结构，不含时间）
 
 | op | 次数 | | op | 次数 |
 |---|---|---|---|---|
@@ -412,17 +430,17 @@ P104-100 只有 15 个 SM。gemm_b 的 144 blocks / 15 = 9.6 波，波次量化�
 但 soft/add/fsmn 这些 dispatch 数量多、单个体积小的算子**很可能是隐藏成本**
 （每 dispatch 有固定开销 + 依赖链串行）。**这正是需要剖面数据来验证的假设。**
 
-### 5.7 剖面之后的优化方向（按预期收益排序，供接手者参考）
+### 5.7 剖面之后的优化方向（**2026-10-13 已拍板：走第 1 条深挖 GEMM**）
 
-1. **如果 GEMM 家族占大头**（<80%）→ 继续压 GEMM：
-   vec4 向量化全局加载（A/B tile 访存指令数减少）、调 occupancy、
-   针对 M=1504 调 BM/BN 减少波次量化。
-2. **如果 soft/add/fsmn/merge/split 占比显著**（>20%）→
-   **融合算子**是最大杠杆（参考原版 CUDA 显然做了融合，否则不会快 1.5 倍）：
-   例如 `split + gemm`、`merge + add`、`fsmn + relu`、`ln + gemm` 合并成单个 kernel，
-   消掉中间 buffer 的写回/重读。
-3. **中间 buffer 的读写带宽**：P104-100 显存带宽只有 ~250 GB/s，若算子是 memory-bound
-   而非 compute-bound，融合的收益会更大。
+1. **GEMM 家族占 83.7% → 继续压 GEMM**（当前主攻）：
+   - vec4 向量化全局加载（A/B tile 访存指令数减为 1/4）；
+   - 调 occupancy / BM-BN 组合，针对 M=1504、N=512 的真实形状减少波次量化（P104 只有 15 SM）；
+   - 单列的 CTC 头 GEMM（#982，19.73 ms，N≈25055）单独调 tile，收益直接可观。
+2. 若 GEMM 压到瓶颈后非 GEMM 份额回升（soft+ln_f16+fsmn 等 >20%）→ 算子融合
+   （`split+gemm`、`merge+add`、`fsmn+relu`、`ln+gemm`），消中间 buffer 写回/重读。
+3. P104-100 显存带宽只有 ~250 GB/s：memory-bound 算子（soft/ln/split/merge）融合收益大。
+
+> 注意：任何改动后先按 §2.1 验证 6/6 gold；GEMM 调优后按 §8 重标定 TDR chunk 公式。
 
 ---
 
@@ -560,16 +578,23 @@ CPU 轨道（2026-10-13 已闭环，无强制待办）：
 - [ ] （暂缓，用户已拍板）softmax exp 向量化 —— 非位级等价，重启需用户批准（§4.8）
 - [ ] （可选）`trace_f`/`SVS_TRACE_FINE` 诊断插桩去留（9 处/层）
 
-GPU 轨道（暂缓，按需重启）：
+GPU 轨道（2026-10-13 已重新激活，主攻方向 = 压 GEMM）：
 
-- [ ] **跑通 `SVS_GPU_PROF=1`**（§5.5，修复已编译，只差验证时间戳）
-- [ ] 用剖面数据决定优化方向（GEMM 深挖 vs 算子融合），见 §5.7
-- [ ] vec4 向量化全局加载（A/B tile 访存指令数减少 1/4）—— 若剖面显示 GEMM 仍占大头
+- [x] **跑通 `SVS_GPU_PROF=1`**（真正根因：MAP_READ 不能与 QUERY_RESOLVE 同 buffer；
+      两段式修复已提交 `79fe2ed`）
+- [x] 用剖面数据决定优化方向：GEMM 家族 83.7% → **深挖 GEMM**（§5.7）
+- [ ] vec4 向量化全局加载（A/B tile 访存指令数减少 1/4）—— 主攻第一项
+- [ ] 单列处理 CTC 头 GEMM（#982，19.7 ms）
 - [ ] GEMM 调优后**重标定 TDR chunk 公式**（单 dispatch 变快后 `(1_400_000/t)` 偏保守，
       批次变小 → 批间 poll 开销占比上升）
+- [ ] 静默环境重跑一次剖面（当前数据有 League/后台 GPU 争用），建立干净基线
 - [ ] **最终 6/6 对齐 + 完整基准 + 更新 `README.md`**（README 的数据表仍是双缓冲前的旧值，
-      必须刷新为 §4.1 的新数字）
+      必须刷新为最终数字）
 - [ ] （可选）清理 `src\gemm_f32.rs.bak*` 遗留文件
+
+> ⚠️ 2026-10-13 实测环境警告：机器上 League of Legends 常驻，GPU/CPU 均有争用，
+> 90s_en GPU encode 从文档的 650 ms 劣化到 ~820–860 ms。**优化 A/B 必须紧邻配对**，
+> 绝对值基线等静默环境再测。
 
 ---
 
