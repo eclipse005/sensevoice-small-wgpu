@@ -116,7 +116,7 @@ fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
     .to_string()
 }
 pub fn split_qkv() -> String {
-    "struct SplitCfg { t_pad: u32, t_valid: u32, scale: f32, _p: u32 };
+    "struct SplitCfg { t_pad: u32, t_valid: u32, scale: f32, skip_kv: u32 };
 @group(0) @binding(0) var<storage, read> Qkv: array<f32>;
 @group(0) @binding(1) var<storage, read_write> Q: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> K: array<vec4<f32>>;
@@ -132,8 +132,10 @@ fn split(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dst = (h * cfg.t_pad + t) * 32u + d4;
     if (t >= cfg.t_valid) {
         Q[dst] = vec4<f32>(0.0);
-        K[dst] = vec4<f32>(0.0);
-        V[dst] = vec4<f32>(0.0);
+        if (cfg.skip_kv == 0u) {
+            K[dst] = vec4<f32>(0.0);
+            V[dst] = vec4<f32>(0.0);
+        }
         return;
     }
     let base = t * 1536u + h * 128u + d4 * 4u;
@@ -143,8 +145,10 @@ fn split(@builtin(global_invocation_id) gid: vec3<u32>) {
         Qkv[base + 2u] * cfg.scale,
         Qkv[base + 3u] * cfg.scale,
     );
-    K[dst] = vec4<f32>(Qkv[base + 512u], Qkv[base + 513u], Qkv[base + 514u], Qkv[base + 515u]);
-    V[dst] = vec4<f32>(Qkv[base + 1024u], Qkv[base + 1025u], Qkv[base + 1026u], Qkv[base + 1027u]);
+    if (cfg.skip_kv == 0u) {
+        K[dst] = vec4<f32>(Qkv[base + 512u], Qkv[base + 513u], Qkv[base + 514u], Qkv[base + 515u]);
+        V[dst] = vec4<f32>(Qkv[base + 1024u], Qkv[base + 1025u], Qkv[base + 1026u], Qkv[base + 1027u]);
+    }
 }
 "
     .to_string()

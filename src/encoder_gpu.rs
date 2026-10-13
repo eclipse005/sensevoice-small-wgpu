@@ -233,6 +233,9 @@ struct Part {
 enum Res<'a> {
     Whole(&'a wgpu::Buffer),
     Part(&'a Part),
+    /// A byte-offset window into a standalone buffer (the K/V slabs of `qkv`
+    /// when the split fusion is on).
+    Window(&'a wgpu::Buffer, u64),
 }
 
 /// Append-only writer for the weight slab.
@@ -1074,14 +1077,19 @@ impl GpuEngine {
                     }))?;
                     ops.push(Op { pipe: Pid::Fsmn, bg: layer.fsmn, slot: fsmn_slot, x: 2, y: pad_u, z: 1 });
                     let split_slot = push(bytemuck::bytes_of(&SplitCfg {
-                        t_pad: pad_u, t_valid: valid_u, scale, p: 0,
+                        t_pad: pad_u, t_valid: valid_u, scale,
+                        p: if tuning::fuse_split() { 1 } else { 0 },
                     }))?;
                     ops.push(Op { pipe: Pid::Split, bg: plan.split, slot: split_slot, x: 1, y: 4, z: pad_u });
                     let bsa = pad_u * 128;
                     let bsc_scores = pad_u * pad_u;
                     push_gemm(
                         &mut push, &mut ops, Pid::Gemm, plan.qk, pad_u, pad_u, 128, pad_u,
-                        bsa, bsa, bsc_scores, 128, 128, 4,
+                        bsa,
+                        if tuning::fuse_split() { 128 } else { bsa },
+                        bsc_scores, 128,
+                        if tuning::fuse_split() { QKV as u32 } else { 128 },
+                        4,
                     )?;
                     let soft_slot = push(bytemuck::bytes_of(&SoftCfg {
                         t_valid: valid_u,
@@ -1102,7 +1110,11 @@ impl GpuEngine {
                     };
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, av_ldc,
-                        bsc_scores, bsa, av_bsc, pad_u, 128, 4,
+                        bsc_scores,
+                        if tuning::fuse_split() { 128 } else { bsa },
+                        av_bsc, pad_u,
+                        if tuning::fuse_split() { QKV as u32 } else { 128 },
+                        4,
                     )?;
                     if !tuning::fuse_merge() {
                         let merge_slot = push(bytemuck::bytes_of(&MergeCfg {
@@ -1334,7 +1346,21 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
         4,
         &engine.uni,
     ));
-    let qk = push(bind(dev, &pipes.gemm_l, "qk", &[(0, Res::Whole(&acts.q)), (1, Res::Whole(&acts.k)), (2, Res::Whole(&acts.scores))], 3, &engine.uni));
+    // Split fusion: K and V are read straight out of `qkv` (column slabs), so
+    // the split pass only has to write Q. `SVS_FUSE_SPLIT=0` uses the k/v
+    // buffers and the full split.
+    let fuse_split = tuning::fuse_split();
+    let k_b = if fuse_split {
+        Res::Window(&acts.qkv, 512 * 4)
+    } else {
+        Res::Whole(&acts.k)
+    };
+    let v_b = if fuse_split {
+        Res::Window(&acts.qkv, 1024 * 4)
+    } else {
+        Res::Whole(&acts.v)
+    };
+    let qk = push(bind(dev, &pipes.gemm_l, "qk", &[(0, Res::Whole(&acts.q)), (1, k_b), (2, Res::Whole(&acts.scores))], 3, &engine.uni));
     let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, Res::Whole(&acts.scores))], 1, &engine.uni));
     let av = push(bind(
         dev, &pipes.gemm_l, "av",
@@ -1343,7 +1369,7 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
         // keeps the separate merge pass.
         &[
             (0, Res::Whole(&acts.scores)),
-            (1, Res::Whole(&acts.v)),
+            (1, v_b),
             (2, if tuning::fuse_merge() { Res::Whole(&acts.ctx) } else { Res::Whole(&acts.av) }),
         ],
         3,
@@ -1496,6 +1522,11 @@ fn bind(
             binding: *b,
             resource: match res {
                 Res::Whole(buf) => buf.as_entire_binding(),
+                Res::Window(buf, off) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: buf,
+                    offset: *off,
+                    size: None,
+                }),
                 Res::Part(p) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &p.buf,
                     offset: p.offset,

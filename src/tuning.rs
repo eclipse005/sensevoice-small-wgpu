@@ -112,6 +112,13 @@ pub fn fuse_merge() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_MERGE").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_FUSE_SPLIT=0` restores the full split pass (fused: K/V are read
+/// straight from `qkv`, the split only writes Q).
+pub fn fuse_split() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_FUSE_SPLIT").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_TILE_SMALL=0` routes every GEMM through the 128×128 tile (the 64×64
 /// short-clip tile is the default for `M <= 512`).
 pub fn tile_small() -> bool {
