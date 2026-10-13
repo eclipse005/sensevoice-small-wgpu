@@ -374,22 +374,65 @@ fn sanm(s: &mut Scratch, layer: &Layer, t: usize, prof: &mut Prof) {
 /// only swapped so the 11 source rows stream linearly instead of being
 /// revisited once per output channel.
 fn fsmn_into(out: &mut [f32], qkv: &[f32], weight: &[f32], t: usize) {
+    if !fsmn_flat() {
+        out.par_chunks_mut(HIDDEN)
+            .enumerate()
+            .for_each(|(time, dst)| {
+                for c in 0..HIDDEN {
+                    let mut acc = 0.0f32;
+                    for k in 0..11 {
+                        let src = time as isize + k as isize - 5;
+                        if src >= 0 && (src as usize) < t {
+                            let v = qkv[src as usize * QKV + 2 * HIDDEN + c];
+                            acc += v * weight[c * 11 + k];
+                        }
+                    }
+                    let v = qkv[time * QKV + 2 * HIDDEN + c];
+                    dst[c] = acc + v;
+                }
+            });
+        return;
+    }
+    // Tap-major copy of the depthwise kernel: `w_t[k * HIDDEN + c]` is the
+    // weight `weight[c * 11 + k]`. 5632 floats once per call; without it the
+    // inner loop would gather the weights at a 44-byte stride.
+    let mut w_t = [0f32; 11 * HIDDEN];
+    for (c, wc) in weight.chunks_exact(11).enumerate() {
+        for (k, w) in wc.iter().enumerate() {
+            w_t[k * HIDDEN + c] = *w;
+        }
+    }
+    // Same numbers, different nest: every channel still adds its taps in
+    // ascending k starting from 0.0 and the centre tap last, so each element is
+    // the same sum in the same order — only now the 512 channels of a tap are
+    // contiguous on both sides and the loop vectorises.
     out.par_chunks_mut(HIDDEN)
         .enumerate()
         .for_each(|(time, dst)| {
-            for c in 0..HIDDEN {
-                let mut acc = 0.0f32;
-                for k in 0..11 {
-                    let src = time as isize + k as isize - 5;
-                    if src >= 0 && (src as usize) < t {
-                        let v = qkv[src as usize * QKV + 2 * HIDDEN + c];
-                        acc += v * weight[c * 11 + k];
+            dst.fill(0.0);
+            for k in 0..11 {
+                let src = time as isize + k as isize - 5;
+                if src >= 0 && (src as usize) < t {
+                    let row = &qkv[src as usize * QKV + 2 * HIDDEN..src as usize * QKV + 3 * HIDDEN];
+                    let wrow = &w_t[k * HIDDEN..(k + 1) * HIDDEN];
+                    for c in 0..HIDDEN {
+                        dst[c] += row[c] * wrow[c];
                     }
                 }
-                let v = qkv[time * QKV + 2 * HIDDEN + c];
-                dst[c] = acc + v;
+            }
+            let centre = time * QKV + 2 * HIDDEN;
+            for c in 0..HIDDEN {
+                dst[c] += qkv[centre + c];
             }
         });
+}
+
+/// Same-binary rollback switch for the FSMN loop-nest swap. Both settings are
+/// bit-identical — `_scratch` runs diff the full `SVS_TRACE` output — so this
+/// exists only for paired A/B timing.
+fn fsmn_flat() -> bool {
+    static FLAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAT.get_or_init(|| std::env::var("SVS_FSMN_FLAT").map_or(true, |v| v != "0"))
 }
 
 fn layer_norm(y: &mut [f32], x: &[f32], w: &[f32], b: &[f32], t: usize, d: usize) {
