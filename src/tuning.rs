@@ -105,6 +105,13 @@ pub fn fuse_relu() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_RELU").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_FUSE_MERGE=0` writes each attention head to its own buffer and runs the
+/// separate merge pass (the fused form writes straight into `ctx`).
+pub fn fuse_merge() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_FUSE_MERGE").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_TILE_SMALL=0` routes every GEMM through the 128×128 tile (the 64×64
 /// short-clip tile is the default for `M <= 512`).
 pub fn tile_small() -> bool {

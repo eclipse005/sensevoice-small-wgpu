@@ -1090,17 +1090,26 @@ impl GpuEngine {
                     // 4096 wide it fits in shared memory and costs one read.
                     let soft_pipe = if pad_u <= 4096 { Pid::SoftCached } else { Pid::Soft };
                     ops.push(Op { pipe: soft_pipe, bg: plan.soft, slot: soft_slot, x: 4 * pad_u, y: 1, z: 1 });
+                    // Fused: C is `ctx` (row stride HIDDEN, head offset 128);
+                    // split: C is the per-head `av` buffer.
+                    let (av_ldc, av_bsc) = if tuning::fuse_merge() {
+                        (HIDDEN as u32, 128)
+                    } else {
+                        (128, pad_u * 128)
+                    };
                     push_gemm(
-                        &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, 128,
-                        bsc_scores, bsa, pad_u * 128, pad_u, 4,
+                        &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, av_ldc,
+                        bsc_scores, bsa, av_bsc, pad_u, 4,
                     )?;
-                    let merge_slot = push(bytemuck::bytes_of(&MergeCfg {
-                        t_pad: pad_u,
-                        t_valid: valid_u,
-                        _p0: 0,
-                        _p1: 0,
-                    }))?;
-                    ops.push(Op { pipe: Pid::Merge, bg: plan.merge, slot: merge_slot, x: 1, y: 4, z: pad_u });
+                    if !tuning::fuse_merge() {
+                        let merge_slot = push(bytemuck::bytes_of(&MergeCfg {
+                            t_pad: pad_u,
+                            t_valid: valid_u,
+                            _p0: 0,
+                            _p1: 0,
+                        }))?;
+                        ops.push(Op { pipe: Pid::Merge, bg: plan.merge, slot: merge_slot, x: 1, y: 4, z: pad_u });
+                    }
                     let n_elem = pad_u * HIDDEN as u32;
                     if !fuse_add {
                         let add_slot = push(bytemuck::bytes_of(&AddCfg {
@@ -1324,7 +1333,14 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
     let soft = push(bind(dev, &pipes.soft_l, "soft", &[(0, Res::Whole(&acts.scores))], 1, &engine.uni));
     let av = push(bind(
         dev, &pipes.gemm_l, "av",
-        &[(0, Res::Whole(&acts.scores)), (1, Res::Whole(&acts.v)), (2, Res::Whole(&acts.av))],
+        // The fused variant writes each head straight into `ctx` (the C stride
+        // is the head offset below); `SVS_FUSE_MERGE=0` writes `acts.av` and
+        // keeps the separate merge pass.
+        &[
+            (0, Res::Whole(&acts.scores)),
+            (1, Res::Whole(&acts.v)),
+            (2, if tuning::fuse_merge() { Res::Whole(&acts.ctx) } else { Res::Whole(&acts.av) }),
+        ],
         3,
         &engine.uni,
     ));
