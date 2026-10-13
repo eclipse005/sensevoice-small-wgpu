@@ -157,12 +157,12 @@ fn gemm_f32_tiled(
             for r in 0..4 {
                 let line = if transb {
                     format!(
-                        "        pfb{c}_{r} = W[bbase + ({kx} + bk{c}) * gd.n + n0 + 4u * bc{c} + {r}u];
+                        "        pfb{c}_{r} = W[bbase + ({kx} + bk{c}) * gd.ldw + n0 + 4u * bc{c} + {r}u];
 "
                     )
                 } else {
                     format!(
-                        "        pfb{c}_{r} = W[bbase + (n0 + 4u * bc{c} + {r}u) * gd.k + {kx} + bk{c}];
+                        "        pfb{c}_{r} = W[bbase + (n0 + 4u * bc{c} + {r}u) * gd.ldw + {kx} + bk{c}];
 "
                     )
                 };
@@ -270,7 +270,7 @@ fn gemm_f32_tiled(
     format!(
         r#"struct GDims {{
     n: u32, k: u32, ldc: u32,
-    bsa: u32, bsb: u32, bsc: u32, lda: u32,
+    bsa: u32, bsb: u32, bsc: u32, lda: u32, ldw: u32,
 }};
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;

@@ -36,6 +36,9 @@ struct GDims {
     bsb: u32,
     bsc: u32,
     lda: u32,
+    /// W row stride in elements. Equal to `k` for a standalone weight matrix;
+    /// larger when the operand is a column slab of `qkv` (the split fusion).
+    ldw: u32,
 }
 
 #[repr(C)]
@@ -1060,7 +1063,7 @@ impl GpuEngine {
                     push_ln(&mut push, &mut ops, ln1_pipe, layer.ln1, layer.in_dim, pad_u)?;
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmB, layer.qkv, pad_u, QKV as u32,
-                        layer.in_dim, QKV as u32, 0, 0, 0, layer.in_dim, 1,
+                        layer.in_dim, QKV as u32, 0, 0, 0, layer.in_dim, layer.in_dim, 1,
                     )?;
                     let fuse_add = tuning::fuse_add();
                     let fsmn_slot = push(bytemuck::bytes_of(&FsmnCfg {
@@ -1078,7 +1081,7 @@ impl GpuEngine {
                     let bsc_scores = pad_u * pad_u;
                     push_gemm(
                         &mut push, &mut ops, Pid::Gemm, plan.qk, pad_u, pad_u, 128, pad_u,
-                        bsa, bsa, bsc_scores, 128, 4,
+                        bsa, bsa, bsc_scores, 128, 128, 4,
                     )?;
                     let soft_slot = push(bytemuck::bytes_of(&SoftCfg {
                         t_valid: valid_u,
@@ -1099,7 +1102,7 @@ impl GpuEngine {
                     };
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmNt, plan.av, pad_u, 128, pad_u, av_ldc,
-                        bsc_scores, bsa, av_bsc, pad_u, 4,
+                        bsc_scores, bsa, av_bsc, pad_u, 128, 4,
                     )?;
                     if !tuning::fuse_merge() {
                         let merge_slot = push(bytemuck::bytes_of(&MergeCfg {
@@ -1130,14 +1133,14 @@ impl GpuEngine {
                     }
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmF32c, layer.outp, pad_u, HIDDEN as u32,
-                        HIDDEN as u32, HIDDEN as u32, 0, 0, 0, HIDDEN as u32, 1,
+                        HIDDEN as u32, HIDDEN as u32, 0, 0, 0, HIDDEN as u32, HIDDEN as u32, 1,
                     )?;
                     push_ln(&mut push, &mut ops, Pid::LnF32F16, layer.ln2, HIDDEN as u32, pad_u)?;
                     // `SVS_FUSE_RELU=0` restores the separate ReLU pass.
                     let w1_pipe = if tuning::fuse_relu() { Pid::GemmBRelu } else { Pid::GemmB };
                     push_gemm(
                         &mut push, &mut ops, w1_pipe, layer.w1, pad_u, FFN as u32,
-                        HIDDEN as u32, FFN as u32, 0, 0, 0, HIDDEN as u32, 1,
+                        HIDDEN as u32, FFN as u32, 0, 0, 0, HIDDEN as u32, HIDDEN as u32, 1,
                     )?;
                     if !tuning::fuse_relu() {
                         let relu_n = pad_u * FFN as u32;
@@ -1159,7 +1162,7 @@ impl GpuEngine {
                     }
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmF32c, layer.w2, pad_u, HIDDEN as u32,
-                        FFN as u32, HIDDEN as u32, 0, 0, 0, FFN as u32, 1,
+                        FFN as u32, HIDDEN as u32, 0, 0, 0, FFN as u32, FFN as u32, 1,
                     )?;
                 }
                 Item::Norm { bg, pipe } => {
@@ -1169,7 +1172,7 @@ impl GpuEngine {
         }
         push_gemm(
             &mut push, &mut ops, Pid::GemmB, plan.ctc, pad_u, CTC_PAD as u32,
-            HIDDEN as u32, CTC_PAD as u32, 0, 0, 0, HIDDEN as u32, 1,
+            HIDDEN as u32, CTC_PAD as u32, 0, 0, 0, HIDDEN as u32, HIDDEN as u32, 1,
         )?;
         let ban_id = match ban {
             Some(id) => id as u32,
@@ -1203,6 +1206,7 @@ fn push_ln(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_gemm(
     push: &mut impl FnMut(&[u8]) -> Result<u32>,
     ops: &mut Vec<Op>,
@@ -1216,9 +1220,10 @@ fn push_gemm(
     bsb: u32,
     bsc: u32,
     lda: u32,
+    ldw: u32,
     z: u32,
 ) -> Result<()> {
-    let g = GDims { n, k, ldc, bsa, bsb, bsc, lda };
+    let g = GDims { n, k, ldc, bsa, bsb, bsc, lda, ldw };
     let slot = push(bytemuck::bytes_of(&g))?;
     // Short audio leaves a 128-row tile with a grid too small to fill 15 SMs
     // (at pad = 512 an outp dispatch is 16 blocks).  The tall tile halves the
