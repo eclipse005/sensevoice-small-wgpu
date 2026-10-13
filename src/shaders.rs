@@ -1,34 +1,50 @@
 //! Small compute shaders. The GEMM itself lives in `gemm_f32`.
 
 pub fn layernorm() -> String {
+    // One thread per row. The row is read as vec4 words, but the four
+    // components are still accumulated x, y, z, w in order, so the f32 sum is
+    // the scalar one bit for bit. `d` is always a multiple of 4 (512 or 560),
+    // so the vec4 view is exact — no tail elements.
     "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
 
-@group(0) @binding(0) var<storage, read>       Src: array<f32>;
-@group(0) @binding(1) var<storage, read>       Wgt: array<f32>;
-@group(0) @binding(2) var<storage, read>       Bia: array<f32>;
+@group(0) @binding(0) var<storage, read>       Src: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       Wgt: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       Bia: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform>             cfg: LnCfg;
-@group(0) @binding(4) var<storage, read_write> Dst: array<f32>;
+@group(0) @binding(4) var<storage, read_write> Dst: array<vec4<f32>>;
 
 @compute @workgroup_size(32)
 fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(local_invocation_id) lid: vec3<u32>) {
     let d = cfg.d;
+    let dv = d / 4u;
     let row = wid.x * 32u + lid.x;
-    let base = row * d;
+    let base = row * dv;
     var mean = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        mean = mean + Src[base + j];
+    for (var j: u32 = 0u; j < dv; j = j + 1u) {
+        let v = Src[base + j];
+        mean = mean + v.x;
+        mean = mean + v.y;
+        mean = mean + v.z;
+        mean = mean + v.w;
     }
     mean = mean / f32(d);
     var var_ = 0.0;
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        let z = Src[base + j] - mean;
-        var_ = var_ + z * z;
+    for (var j: u32 = 0u; j < dv; j = j + 1u) {
+        let v = Src[base + j];
+        let z = v - vec4<f32>(mean);
+        var_ = var_ + z.x * z.x;
+        var_ = var_ + z.y * z.y;
+        var_ = var_ + z.z * z.z;
+        var_ = var_ + z.w * z.w;
     }
     var_ = var_ / f32(d);
     let inv = 1.0 / sqrt(var_ + cfg.eps);
-    for (var j: u32 = 0u; j < d; j = j + 1u) {
-        Dst[base + j] = (Src[base + j] - mean) * inv * Wgt[j] + Bia[j];
+    for (var j: u32 = 0u; j < dv; j = j + 1u) {
+        let v = Src[base + j];
+        let g = Wgt[j];
+        let b = Bia[j];
+        Dst[base + j] = (v - vec4<f32>(mean)) * vec4<f32>(inv) * g + b;
     }
 }
 "

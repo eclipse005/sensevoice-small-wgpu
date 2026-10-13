@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use crate::weights::EMBED_DIM;
@@ -103,38 +104,47 @@ impl Frontend {
             wave[i] = s * 32768.0;
         }
         let mut out = vec![0f32; frames * MEL_BINS];
-        let mut spec = vec![Complex::new(0.0, 0.0); FFT];
-        let mut power = vec![0f32; FFT / 2 + 1];
-        for f in 0..frames {
-            spec.fill(Complex::new(0.0, 0.0));
-            let start = f * SHIFT;
-            let mut mean = 0.0f32;
-            for i in 0..WINDOW {
-                mean += wave[start + i];
-            }
-            mean /= WINDOW as f32;
-            let mut prev = wave[start] - mean;
-            spec[0].re = prev - 0.97 * prev;
-            for i in 1..WINDOW {
-                let cur = wave[start + i] - mean;
-                spec[i].re = (cur - 0.97 * prev) * self.window[i];
-                prev = cur;
-            }
-            spec[0].re *= self.window[0];
-            self.fft.process(&mut spec);
-            for (k, p) in power.iter_mut().enumerate() {
-                let c = spec[k];
-                *p = c.re * c.re + c.im * c.im;
-            }
-            for b in 0..MEL_BINS {
-                let row = &self.mel[b * (FFT / 2 + 1)..(b + 1) * (FFT / 2 + 1)];
-                let mut acc = 0.0f32;
-                for k in 0..power.len() {
-                    acc += power[k] * row[k];
+        // Frames are independent; each rayon task keeps its own FFT scratch
+        // and writes a contiguous run of output rows, so the per-frame
+        // arithmetic (and therefore every bit) is the sequential one.
+        const FRAMES_PER_TASK: usize = 16;
+        out.par_chunks_mut(MEL_BINS * FRAMES_PER_TASK)
+            .enumerate()
+            .for_each(|(task, chunk)| {
+                let mut spec = vec![Complex::new(0.0, 0.0); FFT];
+                let mut power = vec![0f32; FFT / 2 + 1];
+                for (i, orow) in chunk.chunks_mut(MEL_BINS).enumerate() {
+                    let f = task * FRAMES_PER_TASK + i;
+                    spec.fill(Complex::new(0.0, 0.0));
+                    let start = f * SHIFT;
+                    let mut mean = 0.0f32;
+                    for i in 0..WINDOW {
+                        mean += wave[start + i];
+                    }
+                    mean /= WINDOW as f32;
+                    let mut prev = wave[start] - mean;
+                    spec[0].re = prev - 0.97 * prev;
+                    for i in 1..WINDOW {
+                        let cur = wave[start + i] - mean;
+                        spec[i].re = (cur - 0.97 * prev) * self.window[i];
+                        prev = cur;
+                    }
+                    spec[0].re *= self.window[0];
+                    self.fft.process(&mut spec);
+                    for (k, p) in power.iter_mut().enumerate() {
+                        let c = spec[k];
+                        *p = c.re * c.re + c.im * c.im;
+                    }
+                    for (b, dst) in orow.iter_mut().enumerate() {
+                        let row = &self.mel[b * (FFT / 2 + 1)..(b + 1) * (FFT / 2 + 1)];
+                        let mut acc = 0.0f32;
+                        for k in 0..power.len() {
+                            acc += power[k] * row[k];
+                        }
+                        *dst = acc.max(EPS).ln();
+                    }
                 }
-                out[f * MEL_BINS + b] = acc.max(EPS).ln();
-            }
-        }
+            });
         (out, frames)
     }
 }
@@ -202,24 +212,22 @@ pub fn apply_lfr(frames: &[f32], t0: usize) -> Vec<f32> {
         }
     }
     let mut out = vec![0f32; t_lfr * LFR_M * MEL_BINS];
-    for ti in 0..t_lfr {
+    // LFR rows are independent copies out of the padded frame matrix.
+    let need = LFR_M * MEL_BINS;
+    out.par_chunks_mut(need).enumerate().for_each(|(ti, dst)| {
         let start = ti * LFR_N * MEL_BINS;
-        let need = LFR_M * MEL_BINS;
-        let dst = ti * need;
-        out[dst..dst + need].copy_from_slice(&padded[start..start + need]);
-    }
+        dst.copy_from_slice(&padded[start..start + need]);
+    });
     out
 }
 
 fn apply_cmvn(x: &mut [f32], cmvn: &Cmvn) {
     let d = EMBED_DIM;
-    let t = x.len() / d;
-    for i in 0..t {
-        for j in 0..d {
-            let k = i * d + j;
-            x[k] = (x[k] + cmvn.shift[j]) * cmvn.scale[j];
+    x.par_chunks_mut(d).for_each(|row| {
+        for (v, (sh, sc)) in row.iter_mut().zip(cmvn.shift.iter().zip(cmvn.scale.iter())) {
+            *v = (*v + sh) * sc;
         }
-    }
+    });
 }
 
 pub fn add_posenc(x: &mut [f32], t: usize, depth: usize) {
