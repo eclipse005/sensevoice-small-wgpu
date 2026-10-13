@@ -59,29 +59,38 @@ const UNROLL_Q: usize = 4;
 
 /// Shared-memory bytes the default tile's double buffer needs: two alternating
 /// `BM×BK/4` / `BN×BK/4` chunk pairs at 16 bytes each.
-pub const GEMM_SMEM: u32 = (2 * (GEMM_BM as usize + GEMM_BN as usize) * GEMM_BK / 4 * 16) as u32;
+/// The largest slab pair any variant allocates (the tall/BK=16 tile), kept as
+/// the conservative number for the device-limit check in `gpu.rs`.
+pub const GEMM_SMEM: u32 = {
+    let normal = 2 * (GEMM_BM as usize + GEMM_BN as usize) * GEMM_BK / 4 * 16;
+    let tall = 2 * (GEMM_BM_TALL as usize + GEMM_BN as usize) * 16 / 4 * 16;
+    if normal > tall { normal as u32 } else { tall as u32 }
+};
 
 pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, GEMM_TY)
+    gemm_f32_tiled(transb, beta, bias, GEMM_TY, GEMM_BK)
 }
 
-/// The small-M tile: same micro-tile, half the rows per workgroup.  Pair it
-/// with a dispatch that uses `GEMM_BM_TALL` for the m axis.
+/// The small-M tile: same micro-tile, half the rows per workgroup and a deeper
+/// k slab (BK=16), which halves the barrier count.  Measured on 30s_zh: the
+/// 128-row/BK=8 tile gives 156 ms, the tall BK=16 one 145 ms; on 90s_en the
+/// roles flip (454 vs 484 ms) because the deeper slab costs a block of
+/// occupancy, so the encoder picks per dispatch.
 pub fn gemm_f32_tall(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, 8)
+    gemm_f32_tiled(transb, beta, bias, 8, 16)
 }
 
-fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, tyn: usize) -> String {
+fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, tyn: usize, bk: usize) -> String {
     let bm = tyn * GEMM_TM;
     let bn = GEMM_TX * GEMM_TN;
     let nthr = GEMM_TX * tyn;
     let aq = bm / 4; // chunks per k row of A
     let bq = bn / 4;
-    let asm = bm * GEMM_BK / 4; // chunks per slab
-    let bsm = bn * GEMM_BK / 4;
+    let asm = bm * bk / 4; // chunks per slab
+    let bsm = bn * bk / 4;
     assert_eq!(asm % nthr, 0, "A slab must divide evenly over the threads");
     assert_eq!(bsm % nthr, 0, "B slab must divide evenly over the threads");
-    assert_eq!(GEMM_BK % UNROLL_Q, 0, "BK must be a multiple of the unroll");
+    assert_eq!(bk % UNROLL_Q, 0, "BK must be a multiple of the unroll");
     let n_a = asm / nthr;
     let n_b = bsm / nthr;
     let trans = if transb { "1" } else { "0" };
@@ -305,7 +314,7 @@ fn gemm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 "#,
         bm = bm,
         bn = bn,
-        bk = GEMM_BK,
+        bk = bk,
         tm = GEMM_TM,
         tn = GEMM_TN,
         aq = aq,
