@@ -46,3 +46,37 @@ $PY eval_py_d0.py cuda:0 out_py_cuda_d0.json          # Python（dither=0）
 $PY eval_rust.py P104 out_rust_wgpu.json               # Rust wgpu
 $PY eval_compare.py                                    # 一致率 + RTFx + ref CER/WER
 ```
+
+## VAD/API 对齐（切点接口）
+
+**设计：与 VAD 无关**——引擎只吃"切点"。Python(FunASR) 也是同一逻辑：把 VAD 换成桩（只返回切点），
+`inference_with_vad` 就是"切片 → 逐段识别 → 文本空格拼接"。
+
+### 参数映射
+
+| FunASR (Python) | 本仓 Rust |
+|---|---|
+| `language="auto|zh|en|yue|ja|ko|nospeech"` | `--lang` / `Options.language` |
+| `use_itn=True/False` | `--itn`/`--no-itn` / `Options.use_itn` |
+| `ban_emo_unk=True` | `--ban-emo-unk` / `Options.ban_emo_unk` |
+| `vad_segments=[[start_ms,end_ms],…]`（VAD 输出） | `--vad-segments JSON` / `Options.segments` |
+| `merge_vad=True, merge_length_s=15` | `--merge-ms 15000` / `Options.merge_ms` |
+| VAD 模型（fsmn-vad） | **不内置**：只要切点（VAD 无关）✓ |
+
+段语义（`src/vad.rs` 与 FunASR `funasr/utils/vad_utils.py` 逐行对齐）：
+- 切片 `start=int(ms*16)`、`end=min(int(ms*16), len)`（16 kHz，截断）；
+- `merge_vad`：时间点取所有 start/end 去重排序，游标从 **0** 起（含前导静音），
+  当"下一点 − 游标 ≥ max_length"时切一段，末尾补 `[游标, 最后时间点]`；
+- **尾部不转写**（最后一个切点之后的内容被忽略）；
+- 多段结果用 **单个空格** 拼接，顺序按原始切点顺序。
+
+### 端到端验证（`api_align.py` + `api_align_rust.py`）
+
+桩 VAD 把固定切点喂给 FunASR `inference_with_vad`，同一批切点喂给本仓 `--vad-segments`：
+
+| 用例 | merge | 结果 |
+|---|---|---|
+| 180s_en / 90s_ja，10s 定长切点（18/9 段） | 关 / 开(15s) | **文本逐字节一致** |
+| 180s_en / 90s_ja，带静音间隔且不覆盖尾部（8/4 段） | 关 / 开(15s) | **文本逐字节一致** |
+
+合计 **8/8 完全一致**（含尾部忽略、merge、空格拼接语义）。
