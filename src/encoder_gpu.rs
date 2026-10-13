@@ -12,7 +12,8 @@ use bytemuck::{Pod, Zeroable};
 use crate::ctc::{greedy, VOCAB};
 use crate::frontend::Frontend;
 use crate::gemm_f32::{
-    gemm_f32, gemm_f32_bias, gemm_f32_bias_tall, gemm_f32_tall, GEMM_BM, GEMM_BM_TALL, GEMM_BN,
+    gemm_f32, gemm_f32_bias, gemm_f32_bias_tall, gemm_f32_narrow, gemm_f32_tall, GEMM_BM,
+    GEMM_BM_TALL, GEMM_BN,
 };
 use crate::gpu::Gpu;
 use crate::shaders;
@@ -142,6 +143,11 @@ enum Pid {
     GemmNtTall,
     GemmBTall,
     GemmF32cTall,
+    /// The narrow tile (BM=128, BN=64, BK=8) for the middle range of M.
+    GemmNarrow,
+    GemmNtNarrow,
+    GemmBNarrow,
+    GemmF32cNarrow,
     Fsmn,
     Split,
     Soft,
@@ -175,6 +181,10 @@ fn pid_name(p: Pid) -> &'static str {
         Pid::GemmNtTall => "gemm_nt_tall",
         Pid::GemmBTall => "gemm_b_tall",
         Pid::GemmF32cTall => "gemm_f32c_tall",
+        Pid::GemmNarrow => "gemm_narrow",
+        Pid::GemmNtNarrow => "gemm_nt_narrow",
+        Pid::GemmBNarrow => "gemm_b_narrow",
+        Pid::GemmF32cNarrow => "gemm_f32c_narrow",
         Pid::Fsmn => "fsmn",
         Pid::Split => "split",
         Pid::Soft => "soft",
@@ -290,6 +300,10 @@ struct Pipes {
     gemm_nt_tall: wgpu::ComputePipeline,
     gemm_b_tall: wgpu::ComputePipeline,
     gemm_f32c_tall: wgpu::ComputePipeline,
+    gemm_narrow: wgpu::ComputePipeline,
+    gemm_nt_narrow: wgpu::ComputePipeline,
+    gemm_b_narrow: wgpu::ComputePipeline,
+    gemm_f32c_narrow: wgpu::ComputePipeline,
     fsmn: wgpu::ComputePipeline,
     split: wgpu::ComputePipeline,
     soft: wgpu::ComputePipeline,
@@ -1061,7 +1075,8 @@ fn push_ln(
     pad: u32,
 ) -> Result<()> {
     let slot = push(bytemuck::bytes_of(&LnCfg { d, eps: 1e-5, a: 0, b: 0 }))?;
-    ops.push(Op { pipe, bg, slot, x: pad / 32, y: 1, z: 1 });
+    // Four rows per 128-thread workgroup (32 lanes each).
+    ops.push(Op { pipe, bg, slot, x: pad / 4, y: 1, z: 1 });
     Ok(())
 }
 
@@ -1085,7 +1100,12 @@ fn push_gemm(
     // Short audio leaves a 128-row tile with a grid too small to fill 15 SMs
     // (at pad = 512 an outp dispatch is 16 blocks).  The tall tile halves the
     // rows per workgroup, doubling the m axis; it is the same arithmetic.
-    let (pipe, bm) = if m <= 512 {
+    // Tile choice by M, all measured with paired A/B on this card:
+    //   M <= 256  the tall tile (64x128, BK=16) wins by ~5% on 15s_en;
+    //   256 < M <= 512  the narrow tile (128x64, BK=8) wins by ~1% on 30s_zh;
+    //   larger M  the 128x128/BK=8 default, where the deeper slab and the
+    //   extra blocks stop paying.
+    let (pipe, bm, bn) = if m <= 256 {
         (
             match pipe {
                 Pid::Gemm => Pid::GemmTall,
@@ -1095,11 +1115,24 @@ fn push_gemm(
                 other => other,
             },
             GEMM_BM_TALL,
+            GEMM_BN,
+        )
+    } else if m <= 512 {
+        (
+            match pipe {
+                Pid::Gemm => Pid::GemmNarrow,
+                Pid::GemmNt => Pid::GemmNtNarrow,
+                Pid::GemmB => Pid::GemmBNarrow,
+                Pid::GemmF32c => Pid::GemmF32cNarrow,
+                other => other,
+            },
+            128,
+            64,
         )
     } else {
-        (pipe, GEMM_BM)
+        (pipe, GEMM_BM, GEMM_BN)
     };
-    ops.push(Op { pipe, bg, slot, x: n / GEMM_BN, y: m / bm, z });
+    ops.push(Op { pipe, bg, slot, x: n / bn, y: m / bm, z });
     Ok(())
 }
 
@@ -1393,6 +1426,10 @@ impl Pipes {
             gemm_nt_tall: gpu.pipeline("gemm-nt-tall", &gemm_f32_tall(true, false, false), "gemm", &gemm_pl)?,
             gemm_b_tall: gpu.pipeline("gemm-b-tall", &gemm_f32_bias_tall(false), "gemm", &gemm_b_pl)?,
             gemm_f32c_tall: gpu.pipeline("gemm-f32c-tall", &gemm_f32_bias_tall(true), "gemm", &gemm_b_pl)?,
+            gemm_narrow: gpu.pipeline("gemm-narrow", &gemm_f32_narrow(false, false, false), "gemm", &gemm_pl)?,
+            gemm_nt_narrow: gpu.pipeline("gemm-nt-narrow", &gemm_f32_narrow(true, false, false), "gemm", &gemm_pl)?,
+            gemm_b_narrow: gpu.pipeline("gemm-b-narrow", &gemm_f32_narrow(false, false, true), "gemm", &gemm_b_pl)?,
+            gemm_f32c_narrow: gpu.pipeline("gemm-f32c-narrow", &gemm_f32_narrow(false, true, true), "gemm", &gemm_b_pl)?,
             fsmn: gpu.pipeline("fsmn", &shaders::fsmn(), "fsmn", &fsmn_pl)?,
             split: gpu.pipeline("split", &shaders::split_qkv(), "split", &split_pl)?,
             soft: gpu.pipeline("soft", &shaders::softmax(), "softmax", &soft_pl)?,
@@ -1421,7 +1458,8 @@ impl Pipes {
     fn get(&self, id: Pid) -> &wgpu::ComputePipeline {
         match id {
             // One WGSL source, one layout: the three Ln ids differ only in
-            // which buffer they bind, never in behaviour.
+            // which buffer they bind, never in behaviour.  The parallel kernel
+            // is the default; `SVS_LN_PAR=0` rolls back.
             Pid::Ln | Pid::LnF32F16 | Pid::LnF32 => &self.ln,
             Pid::Gemm => &self.gemm,
             Pid::GemmNt => &self.gemm_nt,
@@ -1431,6 +1469,10 @@ impl Pipes {
             Pid::GemmNtTall => &self.gemm_nt_tall,
             Pid::GemmBTall => &self.gemm_b_tall,
             Pid::GemmF32cTall => &self.gemm_f32c_tall,
+            Pid::GemmNarrow => &self.gemm_narrow,
+            Pid::GemmNtNarrow => &self.gemm_nt_narrow,
+            Pid::GemmBNarrow => &self.gemm_b_narrow,
+            Pid::GemmF32cNarrow => &self.gemm_f32c_narrow,
             Pid::Fsmn => &self.fsmn,
             Pid::Split => &self.split,
             Pid::Soft => &self.soft,

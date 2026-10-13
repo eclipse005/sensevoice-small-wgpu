@@ -68,7 +68,7 @@ pub const GEMM_SMEM: u32 = {
 };
 
 pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, GEMM_TY, GEMM_BK)
+    gemm_f32_tiled(transb, beta, bias, GEMM_TX, GEMM_TY, GEMM_BK)
 }
 
 /// The small-M tile: same micro-tile, half the rows per workgroup and a deeper
@@ -77,13 +77,20 @@ pub fn gemm_f32(transb: bool, beta: bool, bias: bool) -> String {
 /// roles flip (454 vs 484 ms) because the deeper slab costs a block of
 /// occupancy, so the encoder picks per dispatch.
 pub fn gemm_f32_tall(transb: bool, beta: bool, bias: bool) -> String {
-    gemm_f32_tiled(transb, beta, bias, 8, 16)
+    gemm_f32_tiled(transb, beta, bias, GEMM_TX, 8, 16)
 }
 
-fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, tyn: usize, bk: usize) -> String {
+/// The narrow tile (BN=64, BK=8): same micro-tile and block size, half the
+/// columns.  Doubles the block count of the n-limited shapes (`N = 512`
+/// projections), which is what the short-clip dispatches starve on.
+pub fn gemm_f32_narrow(transb: bool, beta: bool, bias: bool) -> String {
+    gemm_f32_tiled(transb, beta, bias, 8, 16, 8)
+}
+
+fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, bk: usize) -> String {
     let bm = tyn * GEMM_TM;
-    let bn = GEMM_TX * GEMM_TN;
-    let nthr = GEMM_TX * tyn;
+    let bn = txn * GEMM_TN;
+    let nthr = txn * tyn;
     let aq = bm / 4; // chunks per k row of A
     let bq = bn / 4;
     let asm = bm * bk / 4; // chunks per slab
@@ -321,7 +328,7 @@ fn gemm(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         bq = bq,
         asm = asm,
         bsm = bsm,
-        txn = GEMM_TX,
+        txn = txn,
         tyn = tyn,
         asm2 = 2 * asm,
         bsm2 = 2 * bsm,
@@ -343,4 +350,13 @@ pub fn gemm_f32_bias(beta: bool) -> String {
 
 pub fn gemm_f32_bias_tall(beta: bool) -> String {
     gemm_f32_tall(false, beta, true)
+}
+
+#[cfg(test)]
+mod dump_tests {
+    #[test]
+    fn dump_narrow() {
+        std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_narrow.wgsl", super::gemm_f32_narrow(false, false, false)).unwrap();
+        std::fs::write("D:/SenseVoiceSmall/_scratch/gemm_tall.wgsl", super::gemm_f32_tall(false, false, false)).unwrap();
+    }
 }

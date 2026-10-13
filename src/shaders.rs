@@ -1,10 +1,14 @@
 //! Small compute shaders. The GEMM itself lives in `gemm_f32`.
 
 pub fn layernorm() -> String {
-    // One thread per row. The row is read as vec4 words, but the four
-    // components are still accumulated x, y, z, w in order, so the f32 sum is
-    // the scalar one bit for bit. `d` is always a multiple of 4 (512 or 560),
-    // so the vec4 view is exact — no tail elements.
+    // One row is 128–140 vec4s. Four rows share a 128-thread workgroup whose
+    // 32-lane row groups stage the row into shared memory with coalesced
+    // loads, then **one lane** per row accumulates it in element order — the
+    // exact sequential association the one-thread-per-row form used, so the
+    // result is bit-identical — while the other 31 lanes go idle for those two
+    // loops and rejoin for the elementwise write. Staging is what buys the
+    // parallelism: without it every row is a chain of scalar-latency loads
+    // with one warp per SM to hide them.
     "struct LnCfg { d: u32, eps: f32, _a: u32, _b: u32 };
 
 @group(0) @binding(0) var<storage, read>       Src: array<vec4<f32>>;
@@ -13,44 +17,56 @@ pub fn layernorm() -> String {
 @group(0) @binding(3) var<uniform>             cfg: LnCfg;
 @group(0) @binding(4) var<storage, read_write> Dst: array<vec4<f32>>;
 
-@compute @workgroup_size(32)
+const ROWQ: u32 = 140u;
+var<workgroup> tile: array<vec4<f32>, 560>;
+var<workgroup> stats: array<f32, 8>;
+
+@compute @workgroup_size(128)
 fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let g = lid.x / 32u;
+    let lane = lid.x % 32u;
+    let row = wid.x * 4u + g;
     let d = cfg.d;
     let dv = d / 4u;
-    let row = wid.x * 32u + lid.x;
     let base = row * dv;
-    var mean = 0.0;
-    for (var j: u32 = 0u; j < dv; j = j + 1u) {
-        let v = Src[base + j];
-        mean = mean + v.x;
-        mean = mean + v.y;
-        mean = mean + v.z;
-        mean = mean + v.w;
+    for (var c: u32 = lane; c < dv; c = c + 32u) {
+        tile[g * ROWQ + c] = Src[base + c];
     }
-    mean = mean / f32(d);
-    var var_ = 0.0;
-    for (var j: u32 = 0u; j < dv; j = j + 1u) {
-        let v = Src[base + j];
-        let z = v - vec4<f32>(mean);
-        var_ = var_ + z.x * z.x;
-        var_ = var_ + z.y * z.y;
-        var_ = var_ + z.z * z.z;
-        var_ = var_ + z.w * z.w;
+    workgroupBarrier();
+    if (lane == 0u) {
+        var mean = 0.0;
+        for (var c: u32 = 0u; c < dv; c = c + 1u) {
+            let v = tile[g * ROWQ + c];
+            mean = mean + v.x;
+            mean = mean + v.y;
+            mean = mean + v.z;
+            mean = mean + v.w;
+        }
+        stats[g * 2u] = mean / f32(d);
     }
-    var_ = var_ / f32(d);
-    let inv = 1.0 / sqrt(var_ + cfg.eps);
-    for (var j: u32 = 0u; j < dv; j = j + 1u) {
-        let v = Src[base + j];
-        let g = Wgt[j];
-        let b = Bia[j];
-        Dst[base + j] = (v - vec4<f32>(mean)) * vec4<f32>(inv) * g + b;
+    workgroupBarrier();
+    let mean = stats[g * 2u];
+    if (lane == 0u) {
+        var var_ = 0.0;
+        for (var c: u32 = 0u; c < dv; c = c + 1u) {
+            let z = tile[g * ROWQ + c] - vec4<f32>(mean);
+            var_ = var_ + z.x * z.x;
+            var_ = var_ + z.y * z.y;
+            var_ = var_ + z.z * z.z;
+            var_ = var_ + z.w * z.w;
+        }
+        stats[g * 2u + 1u] = 1.0 / sqrt(var_ / f32(d) + cfg.eps);
+    }
+    workgroupBarrier();
+    let inv = stats[g * 2u + 1u];
+    for (var c: u32 = lane; c < dv; c = c + 32u) {
+        Dst[base + c] = (tile[g * ROWQ + c] - vec4<f32>(mean)) * vec4<f32>(inv) * Wgt[c] + Bia[c];
     }
 }
 "
     .to_string()
 }
-
 pub fn split_qkv() -> String {
     "struct SplitCfg { t_pad: u32, t_valid: u32, scale: f32, _p: u32 };
 @group(0) @binding(0) var<storage, read> Qkv: array<f32>;
