@@ -52,5 +52,12 @@
   内存/devVRAM 栏仍是 objective ② 的对照来源。
 - **口径差异**：本仓 devVRAM 是 nvidia-smi 逐进程实际占用；CUDA 侧是 `torch.cuda.max_memory_reserved()`
   （含分配器缓存，一般 ≥ 实际）。即本仓在更严的口径下比较。
-- **CPU 全迹比对**：`trace_base_90s_en.txt` 经 git checkout 后是 CRLF，比对前先 `tr -d ''`。
+- **CPU 全迹比对**：`trace_base_90s_en.txt` 经 git checkout 后是 CRLF，比对前先 `tr -d '
+'`。
 - **权重精度核对**：CUDA 侧为 `torch.float32` 234.0M 参数 = 892.6 MiB（实测），与本仓 f32 slab ~893 MiB 打平。
+
+## 回退开关可用性（约束"保留同二进制回退开关"）
+- `fallback_switches.txt`：10 个开关（`SVS_TILE_SMALL/WIDE`、`SVS_FUSE_RELU/ADD/MERGE/SPLIT`、
+  `SVS_FSMN_TAP/FLAT`、`SVS_BIAS_FOLD`、`SVS_RB_FUSED`）取回退值后，6 素材 GPU gold **全部逐 token 一致**。
+- 该验证暴露并修复了一个真实缺陷：`SVS_FUSE_ADD=0` 时 fsmn 的 Out 绑定仍指向 `dst_buf`，
+  而独立的 `add` op 读 `acts.fsmn`（从未写入）→ 回退路径输出错误 token；已改为按开关选择绑定。

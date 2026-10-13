@@ -1465,14 +1465,18 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
             &engine.uni,
         ));
         // The fused memory pass writes the residual target directly and folds
-        // the add in (`SVS_FUSE_ADD=0` restores the separate `add` op, which
-        // reads `acts.fsmn` instead).
+        // the add in. With `SVS_FUSE_ADD=0` it must write its plain memory
+        // output to `acts.fsmn` instead, because the separate `add` op reads
+        // that buffer (it was wired to `dst_buf` unconditionally before, so
+        // the fallback path added a never-written buffer and produced wrong
+        // tokens).
+        let fsmn_out = if tuning::fuse_add() { dst_buf } else { &acts.fsmn };
         let fsmn = push(bind(
             dev, &pipes.fsmn_l, "fsmn",
             &[
                 (0, Res::Whole(&acts.qkv)),
                 (1, Res::Part(&layer.fsmn)),
-                (3, Res::Whole(dst_buf)),
+                (3, Res::Whole(fsmn_out)),
                 (4, Res::Whole(src_buf)),
             ],
             2,

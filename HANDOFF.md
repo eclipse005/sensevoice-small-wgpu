@@ -856,3 +856,9 @@ GPU 轨道（2026-10-13 第一轮已完成，见 §5.8）：
   - 原始测量落盘 `docs/evidence/`：`median_n5.txt`（202.8/244.3/218.3/216.6/175.8/169.1）、`peak_rss_6.txt`（969–979 MiB）、`devvram_6.txt`（1093/1091/1349/1349/1631/1643）、`cpu_prof_*.txt`；协议脚本 `bench_median.ps1`/`bench_mem.ps1`/`bench_cuda_warm.py`/`peak_mem.ps1` 与 `trace_base_90s_en.txt` 一并入仓；`docs/evidence/README.md` 为逐条索引。
   - 措辞更正：README/HANDOFF 的 N=5 数字均为"每素材 5 次取中位"（脚本原样输出）；历轮"最优"指跨轮最好，非单次最好。
 - **仍待用户裁定**：② 的 15s_en 1093 vs 1044（+4.7%）。用户已口头给出"相当=±10%"口径，需 `/goal-tweak` 写入目标，之后才能再次申请完成。
+
+### 5.8.12 回退开关全矩阵验证：发现并修复 SVS_FUSE_ADD 接线缺陷
+- 审计驱动的验证：10 个回退开关（=0）× 6 素材全跑 gold，发现 **`SVS_FUSE_ADD=0` 路径输出错误 token**（30s_zh/90s_en 均不一致）。
+- 根因：`build_plan` 中 fsmn 的 Out 绑定无条件指向 `dst_buf`；回退时该 FSMN 写的是**不带残差的** mem，而随后的 `add` op 读 `acts.fsmn`（从未写入）→ 残差加错。修法：`fsmn_out = if tuning::fuse_add() { dst_buf } else { &acts.fsmn }`。
+- 复验：默认路径 6/6 gold 不变；`SVS_FUSE_ADD=0` 6/6 一致；其余 9 个开关 ×6 素材全绿 → `docs/evidence/fallback_switches.txt`。
+  （此前该开关的等价性只有文字声称，从未实测；本次由审计触发的"证据可复核化"暴露。）
