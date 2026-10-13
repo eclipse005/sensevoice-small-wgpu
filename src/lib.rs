@@ -121,21 +121,69 @@ pub struct Model {
     device: String,
 }
 
+
+/// Temporary memory probe (`SVS_MEM_TRACE=1`): peak working set at load phases.
+fn mem_probe(tag: &str) {
+    if std::env::var("SVS_MEM_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Pmc {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                counters: *mut Pmc,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc = Pmc { cb: std::mem::size_of::<Pmc>() as u32, ..Default::default() };
+        unsafe {
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                eprintln!(
+                    "mem_probe {tag}: peak_ws {:.1} MiB  cur {:.1} MiB",
+                    pmc.peak_working_set_size as f64 / 1048576.0,
+                    pmc.working_set_size as f64 / 1048576.0
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = tag;
+}
+
 impl Model {
     pub fn load(model_dir: &Path, device: &str) -> Result<Self> {
         let sel = DeviceSelector::parse(device)?;
-        let weights = Weights::load(model_dir)?;
+        let mut weights = Weights::load(model_dir)?;
+        mem_probe("after Weights::load");
         let embed = weights.embed.clone();
         let front = Frontend::load(model_dir)?;
         let tok = Tokenizer::load(model_dir)?;
+        mem_probe("after Frontend+Tokenizer");
         let (engine, device) = if sel == DeviceSelector::Cpu {
             (Engine::Cpu(CpuEngine::new(weights)), "cpu".to_string())
         } else {
             let gpu = pollster::block_on(Gpu::new_with(sel))?;
             let device = gpu.describe();
             eprintln!("sensevoice: {device}");
-            let engine = GpuEngine::new(gpu, &weights, &front)?;
-            drop(weights);
+            let engine = GpuEngine::new(gpu, &mut weights, &front)?;
+            mem_probe("after GpuEngine::new");
             (Engine::Gpu(engine), device)
         };
         Ok(Self {
@@ -145,6 +193,20 @@ impl Model {
             engine,
             device,
         })
+    }
+
+    /// Size the GPU frame buffers for a clip of `n_samples` samples. The CLI
+    /// loads the audio before the model, so it can hand the length in and keep
+    /// both the reallocation and the oversized preallocation out of the run.
+    pub fn reserve_samples(&mut self, n_samples: usize) -> Result<()> {
+        if let Engine::Gpu(gpu) = &mut self.engine {
+            if n_samples >= WINDOW {
+                let n_fbank = 1 + (n_samples - WINDOW) / SHIFT;
+                let lfr_rows = (n_fbank + LFR_N - 1) / LFR_N;
+                gpu.reserve_frames(lfr_rows + 4)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn device(&self) -> &str {

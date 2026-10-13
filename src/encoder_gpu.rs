@@ -356,26 +356,85 @@ pub struct GpuEngine {
     max_t: usize,
 }
 
+
+/// Temporary (`SVS_MEM_TRACE=1`) working-set probe for the load path.
+fn mem_probe(tag: &str) {
+    if std::env::var("SVS_MEM_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct Pmc {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut core::ffi::c_void,
+                counters: *mut Pmc,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc = Pmc { cb: std::mem::size_of::<Pmc>() as u32, ..Default::default() };
+        unsafe {
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                eprintln!(
+                    "mem_probe {tag}: peak_ws {:.1} MiB  cur {:.1} MiB",
+                    pmc.peak_working_set_size as f64 / 1048576.0,
+                    pmc.working_set_size as f64 / 1048576.0
+                );
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = tag;
+}
+
 impl GpuEngine {
-    pub fn new(gpu: Gpu, weights: &Weights, front: &Frontend) -> Result<Self> {
+    /// Uploads and **drains** `weights`: every host-side vector is taken out and
+    /// dropped as soon as its GPU buffer exists. Holding the whole model
+    /// (~900 MiB) while the driver grows its own upload-side footprint stacked
+    /// the two peaks to ~1.5 GiB; handing the memory back layer by layer keeps
+    /// the high-water mark at the model size itself.
+    pub fn new(gpu: Gpu, weights: &mut Weights, front: &Frontend) -> Result<Self> {
         let slot = (gpu.limits.min_uniform_buffer_offset_alignment as u64).max(256);
         let max_t = max_frames(gpu.limits.max_storage_buffer_binding_size as u64);
         if max_t < TILE as usize {
             bail!("这张 GPU 的 storage 上限放不下一帧对齐后的注意力矩阵");
         }
         eprintln!("sensevoice: 编译 compute pipeline");
+        mem_probe("before Pipes::new");
         let pipes = Pipes::new(&gpu)?;
+        mem_probe("after Pipes::new");
         eprintln!("sensevoice: 上传权重");
         let mut layers = Vec::with_capacity(weights.layers.len() + weights.tp.len());
-        for layer in weights.layers.iter().chain(weights.tp.iter()) {
+        for layer in weights.layers.iter_mut().chain(weights.tp.iter_mut()) {
             layers.push(upload_layer(&gpu, layer)?);
         }
-        let after_w = up_f32(&gpu, &weights.after_w)?;
-        let after_b = up_f32(&gpu, &weights.after_b)?;
-        let tp_w = up_f32(&gpu, &weights.tp_w)?;
-        let tp_b = up_f32(&gpu, &weights.tp_b)?;
-        let ctc_w = up_mat(&gpu, &weights.ctc.w, weights.ctc.rows, weights.ctc.cols, CTC_PAD)?;
-        let ctc_b = up_bias(&gpu, &weights.ctc.b, CTC_PAD)?;
+        let after_w = up_f32(&gpu, &std::mem::take(&mut weights.after_w))?;
+        let after_b = up_f32(&gpu, &std::mem::take(&mut weights.after_b))?;
+        let tp_w = up_f32(&gpu, &std::mem::take(&mut weights.tp_w))?;
+        let tp_b = up_f32(&gpu, &std::mem::take(&mut weights.tp_b))?;
+        let ctc_w = up_mat(
+            &gpu,
+            &std::mem::take(&mut weights.ctc.w),
+            weights.ctc.rows,
+            weights.ctc.cols,
+            CTC_PAD,
+        )?;
+        let ctc_b = up_bias(&gpu, &std::mem::take(&mut weights.ctc.b), CTC_PAD)?;
         // Frontend tables: the same window/mel/CMVN the CPU path uses, plus
         // the position-encoding inverse table (`add_posenc`'s `inv`, computed
         // with the same formula so the kernels stay table-driven).
@@ -394,8 +453,10 @@ impl GpuEngine {
         };
         let fbank_cfg = gpu.uniform("fbank-cfg", 256);
         let lfr_cfg = gpu.uniform("lfr-cfg", 256);
+        mem_probe("after weight uploads");
         let uni = gpu.uniform("uni", SLOTS as u64 * slot);
         gpu.flush()?;
+        mem_probe("after flush");
         let mut engine = Self {
             gpu,
             pipes,
@@ -426,7 +487,7 @@ impl GpuEngine {
         // bind groups, clears) inside the timed region — ~18 ms at 90 s. Model
         // load is outside the RTFx clock, so pay it there. 3072 frames covers
         // ~184 s of audio; longer clips still grow on demand.
-        engine.alloc_for(3072.min(max_t))?;
+        engine.alloc_for(512.min(max_t))?;
         Ok(engine)
     }
 
@@ -645,6 +706,15 @@ fn scan_f32(name: &str, bytes: &[u8]) {
 }
 
 impl GpuEngine {
+    /// Allocate the frame buffers for a clip of `t` frames ahead of time.
+    /// Called by `Model::reserve_samples` before the RTFx clock starts, so the
+    /// first utterance neither pays a reallocation nor leaves the engine sized
+    /// for a clip it never saw.
+    pub fn reserve_frames(&mut self, t: usize) -> Result<()> {
+        self.ensure(t)?;
+        Ok(())
+    }
+
     fn ensure(&mut self, t: usize) -> Result<usize> {
         let pad = (t + TILE as usize - 1) / TILE as usize * TILE as usize;
         if pad > self.max_t {
@@ -1538,22 +1608,47 @@ fn buf_entry(binding: u32, read_only: bool, dynamic: bool) -> wgpu::BindGroupLay
     }
 }
 
-fn upload_layer(gpu: &Gpu, layer: &crate::weights::Layer) -> Result<LayerGpu> {
+fn upload_layer(gpu: &Gpu, layer: &mut crate::weights::Layer) -> Result<LayerGpu> {
+    let in_dim = layer.in_dim as u32;
     Ok(LayerGpu {
-        n1w: up_f32(gpu, &layer.n1_w)?,
-        n1b: up_f32(gpu, &layer.n1_b)?,
-        qkv: up_mat(gpu, &layer.qkv.w, layer.qkv.rows, layer.qkv.cols, layer.qkv.rows)?,
-        qkv_b: up_bias(gpu, &layer.qkv.b, layer.qkv.rows)?,
-        fsmn: up_f32(gpu, &layer.fsmn)?,
-        outw: up_mat(gpu, &layer.out.w, layer.out.rows, layer.out.cols, layer.out.rows)?,
-        outb: up_bias(gpu, &layer.out.b, layer.out.rows)?,
-        n2w: up_f32(gpu, &layer.n2_w)?,
-        n2b: up_f32(gpu, &layer.n2_b)?,
-        w1: up_mat(gpu, &layer.w1.w, layer.w1.rows, layer.w1.cols, layer.w1.rows)?,
-        w1b: up_bias(gpu, &layer.w1.b, layer.w1.rows)?,
-        w2: up_mat(gpu, &layer.w2.w, layer.w2.rows, layer.w2.cols, layer.w2.rows)?,
-        w2b: up_bias(gpu, &layer.w2.b, layer.w2.rows)?,
-        in_dim: layer.in_dim as u32,
+        n1w: up_f32(gpu, &std::mem::take(&mut layer.n1_w))?,
+        n1b: up_f32(gpu, &std::mem::take(&mut layer.n1_b))?,
+        qkv: up_mat(
+            gpu,
+            &std::mem::take(&mut layer.qkv.w),
+            layer.qkv.rows,
+            layer.qkv.cols,
+            layer.qkv.rows,
+        )?,
+        qkv_b: up_bias(gpu, &std::mem::take(&mut layer.qkv.b), layer.qkv.rows)?,
+        fsmn: up_f32(gpu, &std::mem::take(&mut layer.fsmn))?,
+        outw: up_mat(
+            gpu,
+            &std::mem::take(&mut layer.out.w),
+            layer.out.rows,
+            layer.out.cols,
+            layer.out.rows,
+        )?,
+        outb: up_bias(gpu, &std::mem::take(&mut layer.out.b), layer.out.rows)?,
+        n2w: up_f32(gpu, &std::mem::take(&mut layer.n2_w))?,
+        n2b: up_f32(gpu, &std::mem::take(&mut layer.n2_b))?,
+        w1: up_mat(
+            gpu,
+            &std::mem::take(&mut layer.w1.w),
+            layer.w1.rows,
+            layer.w1.cols,
+            layer.w1.rows,
+        )?,
+        w1b: up_bias(gpu, &std::mem::take(&mut layer.w1.b), layer.w1.rows)?,
+        w2: up_mat(
+            gpu,
+            &std::mem::take(&mut layer.w2.w),
+            layer.w2.rows,
+            layer.w2.cols,
+            layer.w2.rows,
+        )?,
+        w2b: up_bias(gpu, &std::mem::take(&mut layer.w2.b), layer.w2.rows)?,
+        in_dim,
     })
 }
 
@@ -1563,21 +1658,25 @@ fn up_bias(gpu: &Gpu, data: &[f32], cols_pad: usize) -> Result<wgpu::Buffer> {
     up_f32(gpu, &v)
 }
 
+/// Row-major `[rows, cols]` into a `[rows_pad, cols]` buffer. The pad rows are
+/// the tail, so the source uploads as one contiguous slice and the tail is
+/// zeroed first — building a padded host copy just to insert ~60 KB of zeros
+/// costs the full matrix again for the CTC head (51 MB).
 fn up_mat(gpu: &Gpu, data: &[f32], rows: usize, cols: usize, rows_pad: usize) -> Result<wgpu::Buffer> {
-    let mut v = vec![0f32; rows_pad * cols];
-    for r in 0..rows {
-        let at = r * cols;
-        v[at..at + cols].copy_from_slice(&data[at..at + cols]);
+    assert_eq!(data.len(), rows * cols, "up_mat source shape");
+    let buf = gpu.storage("f32", (rows_pad * cols * 4) as u64);
+    if rows_pad > rows {
+        let mut enc = gpu.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&buf, 0, None);
+        gpu.queue.submit([enc.finish()]);
+        gpu.flush()?;
     }
-    up_f32(gpu, &v)
+    gpu.upload_chunked(&buf, bytemuck::cast_slice(data))?;
+    Ok(buf)
 }
 
 fn up_f32(gpu: &Gpu, data: &[f32]) -> Result<wgpu::Buffer> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    let buf = gpu.storage("f32", bytes.len() as u64);
-    gpu.upload_chunked(&buf, &bytes)?;
+    let buf = gpu.storage("f32", (data.len() * 4) as u64);
+    gpu.upload_chunked(&buf, bytemuck::cast_slice(data))?;
     Ok(buf)
 }

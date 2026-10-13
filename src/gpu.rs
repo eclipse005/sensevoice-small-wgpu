@@ -6,6 +6,11 @@ pub struct Gpu {
     pub info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
     pub features: wgpu::Features,
+    /// Bytes staged by `write_buffer` since the last drain. It is cumulative
+    /// across calls on purpose: `write_buffer` keeps the host copy until the
+    /// queue drains, and a per-call counter lets the small per-tensor writes
+    /// accumulate the whole model (~900 MiB) before anything is polled.
+    pending: std::cell::Cell<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -108,7 +113,26 @@ async fn adapters_for(selector: &DeviceSelector) -> Vec<wgpu::Adapter> {
             let b = wgpu::Backends::from(*api);
             instance_for(b).enumerate_adapters(b).await
         }
-        DeviceSelector::Index(_) | DeviceSelector::Name(_) => {
+        // A name match tries Vulkan first: creating an instance over *every*
+        // backend costs ~585 MiB of driver working set on this machine
+        // (DX12/GL bring up their own runtimes), against ~55 MiB for Vulkan
+        // alone.  If nothing matches on Vulkan the caller falls back below.
+        DeviceSelector::Name(_) => {
+            let vulkan = instance_for(wgpu::Backends::VULKAN)
+                .enumerate_adapters(wgpu::Backends::VULKAN)
+                .await;
+            if vulkan
+                .iter()
+                .any(|a| selector.matches(&a.get_info()) && device_class(a.get_info().device_type) <= 2)
+            {
+                vulkan
+            } else {
+                instance_for(wgpu::Backends::all())
+                    .enumerate_adapters(wgpu::Backends::all())
+                    .await
+            }
+        }
+        DeviceSelector::Index(_) => {
             instance_for(wgpu::Backends::all())
                 .enumerate_adapters(wgpu::Backends::all())
                 .await
@@ -263,6 +287,7 @@ impl Gpu {
             info,
             limits,
             features: feats,
+            pending: std::cell::Cell::new(0),
         })
     }
 
@@ -306,13 +331,17 @@ impl Gpu {
 
     pub fn upload_chunked(&self, buf: &wgpu::Buffer, data: &[u8]) -> Result<()> {
         const CHUNK: usize = 8 << 20;
-        let mut pending = 0usize;
         for (i, piece) in data.chunks(CHUNK).enumerate() {
             self.queue.write_buffer(buf, (i * CHUNK) as u64, piece);
-            pending += piece.len();
+            let pending = self.pending.get() + piece.len();
             if pending >= CHUNK {
-                self.pump()?;
-                pending = 0;
+                // Poll, not just submit: `write_buffer` stages host memory and
+                // the copy only retires when the queue drains. Uploading is a
+                // load-time cost, so the wait is free and bounds the staging.
+                self.flush()?;
+                self.pending.set(0);
+            } else {
+                self.pending.set(pending);
             }
         }
         Ok(())

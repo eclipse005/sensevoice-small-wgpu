@@ -22,6 +22,52 @@ fn main() -> ExitCode {
     }
 }
 
+
+#[cfg(windows)]
+fn rss_mb() -> f64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Pmc {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut Pmc,
+            cb: u32,
+        ) -> i32;
+    }
+    let mut pmc = Pmc { cb: std::mem::size_of::<Pmc>() as u32, ..Default::default() };
+    unsafe {
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            return pmc.peak_working_set_size as f64 / (1024.0 * 1024.0);
+        }
+    }
+    -1.0
+}
+
+#[cfg(not(windows))]
+fn rss_mb() -> f64 {
+    -1.0
+}
+
+fn mem_trace(tag: &str) {
+    if std::env::var("SVS_MEM_TRACE").ok().as_deref() == Some("1") {
+        eprintln!("mem_trace {tag}: peak_ws {:.1} MiB", rss_mb());
+    }
+}
+
 fn run() -> Result<()> {
     let args = Args::parse()?;
     if args.help {
@@ -37,6 +83,7 @@ fn run() -> Result<()> {
     let wav = args.wav.as_ref().context("缺少 --wav")?;
     language_id(&args.lang)?;
     let samples = load_audio(wav)?;
+    mem_trace("after load_audio");
     let opt = Options {
         language: args.lang.clone(),
         use_itn: args.use_itn,
@@ -44,8 +91,12 @@ fn run() -> Result<()> {
         segments: args.segments.clone(),
         merge_ms: args.merge_ms,
     };
+    mem_trace("before Model::load");
     let mut model = Model::load(&args.model, &args.device)?;
+    model.reserve_samples(samples.len())?;
+    mem_trace("after Model::load");
     let transcript = model.transcribe(&samples, &opt)?;
+    mem_trace("after transcribe");
     if transcript.segments.is_empty() {
         bail!("没有够长的音频段（短于 25 ms 的段会被跳过）");
     }
