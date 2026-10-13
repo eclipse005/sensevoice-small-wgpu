@@ -103,7 +103,7 @@ fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, 
     let trans = if transb { "1" } else { "0" };
     let beta_s = if beta { "1" } else { "0" };
     let bias_s = if bias {
-        "@group(0) @binding(4) var<storage, read> Bias: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> Bias: array<vec4<f32>>;\n"
     } else {
         ""
     };
@@ -235,29 +235,37 @@ fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, 
         }
     }
 
-    // Epilogue: accumulate, add bias, add C when beta, store.
+    // Epilogue: accumulate, add bias, add C when beta, store — four columns
+    // at a time. The thread’s TN columns are contiguous and `ldc`, the tile
+    // origins and the bias lengths are all multiples of four, so the bias fetch
+    // and the C store/read are `vec4` accesses: sixteen of each per thread
+    // instead of sixty-four. Same values, same operations, same order.
+    assert_eq!(GEMM_TN % 4, 0, "the vec4 epilogue assumes TN % 4 == 0");
     let mut epilogue = String::new();
     for i in 0..GEMM_TM {
         epilogue.push_str(&format!("    let row{i} = m0 + ty * TM + {i}u;\n"));
     }
     for i in 0..GEMM_TM {
-        for j in 0..GEMM_TN {
+        for g in 0..GEMM_TN / 4 {
+            let j0 = g * 4;
             let bias_line = if bias {
-                format!("    o{i}_{j} = o{i}_{j} + Bias[col{i}_{j}];\n")
+                format!("    o{i}_{g} = o{i}_{g} + Bias[(n0 + tx * TN + {j0}u) / 4u];\n")
             } else {
                 String::new()
             };
             epilogue.push_str(&format!(
-                "    let col{i}_{j} = n0 + tx * TN + {j}u;\n\
-                 var o{i}_{j} = c{i}{j};\n\
+                "    let col{i}_{g} = n0 + tx * TN + {j0}u;\n\
+                 var o{i}_{g} = vec4<f32>(c{i}{j0}, c{i}{j1}, c{i}{j2}, c{i}{j3});\n\
                  {bias_line}\
-                 let dst{i}_{j} = cbase + row{i} * gd.ldc + col{i}_{j};\n\
-                 if (BETA == 1u) {{ o{i}_{j} = o{i}_{j} + C[dst{i}_{j}]; }}\n\
-                 C[dst{i}_{j}] = o{i}_{j};\n"
+                 let dst{i}_{g} = cbase + row{i} * gd.ldc + col{i}_{g};\n\
+                 if (BETA == 1u) {{ o{i}_{g} = o{i}_{g} + C[dst{i}_{g} / 4u]; }}\n\
+                 C[dst{i}_{g} / 4u] = o{i}_{g};\n",
+                j1 = j0 + 1,
+                j2 = j0 + 2,
+                j3 = j0 + 3,
             ));
         }
     }
-
     let store0 = store("0u", "0u");
     let store1 = store("nbuf * ASM", "nbuf * BSM");
 
@@ -268,7 +276,7 @@ fn gemm_f32_tiled(transb: bool, beta: bool, bias: bool, txn: usize, tyn: usize, 
 }};
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
-@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> gd: GDims;
 {bias_s}
 const BM: u32 = {bm}u;
