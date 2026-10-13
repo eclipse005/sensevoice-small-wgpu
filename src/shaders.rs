@@ -125,19 +125,25 @@ fn merge(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 pub fn fsmn() -> String {
-    "struct FsmnCfg { t_valid: u32, t_pad: u32, _p0: u32, _p1: u32 };
+    // `cfg._p0` is the residual mode: 1 adds the layer input (`Src`) to the
+    // memory output and stores the sum directly, which is what the separate
+    // `add` pass used to do — the same `src + (acc + v)` association, one pass
+    // fewer. 0 stores the memory output alone (layer 0).
+    "struct FsmnCfg { t_valid: u32, t_pad: u32, mode: u32, _p1: u32 };
 @group(0) @binding(0) var<storage, read> Qkv: array<f32>;
 @group(0) @binding(1) var<storage, read> W: array<f32>;
 @group(0) @binding(2) var<uniform> cfg: FsmnCfg;
 @group(0) @binding(3) var<storage, read_write> Out: array<f32>;
+@group(0) @binding(4) var<storage, read> Src: array<f32>;
 
 @compute @workgroup_size(256)
 fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     let t = gid.y;
+    let at = t * 512u + c;
     if (c >= 512u || t >= cfg.t_pad) { return; }
     if (t >= cfg.t_valid) {
-        Out[t * 512u + c] = 0.0;
+        Out[at] = select(0.0, Src[at], cfg.mode == 1u);
         return;
     }
     var acc = 0.0;
@@ -149,7 +155,8 @@ fn fsmn(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     let v = Qkv[t * 1536u + 1024u + c];
-    Out[t * 512u + c] = acc + v;
+    let mem = acc + v;
+    Out[at] = select(mem, Src[at] + mem, cfg.mode == 1u);
 }
 "
     .to_string()

@@ -66,7 +66,8 @@ struct SplitCfg {
 struct FsmnCfg {
     t_valid: u32,
     t_pad: u32,
-    _p0: u32,
+    /// 1 = add the layer input (the fused residual), 0 = memory output alone.
+    mode: u32,
     _p1: u32,
 }
 
@@ -1077,10 +1078,11 @@ impl GpuEngine {
                         &mut push, &mut ops, Pid::GemmB, layer.qkv, pad_u, QKV as u32,
                         layer.in_dim, QKV as u32, 0, 0, 0, layer.in_dim, 1,
                     )?;
+                    let fuse_add = tuning::fuse_add();
                     let fsmn_slot = push(bytemuck::bytes_of(&FsmnCfg {
                         t_valid: valid_u,
                         t_pad: pad_u,
-                        _p0: 0,
+                        mode: if fuse_add { layer.add_mode } else { 0 },
                         _p1: 0,
                     }))?;
                     ops.push(Op { pipe: Pid::Fsmn, bg: layer.fsmn, slot: fsmn_slot, x: 2, y: pad_u, z: 1 });
@@ -1116,21 +1118,23 @@ impl GpuEngine {
                     }))?;
                     ops.push(Op { pipe: Pid::Merge, bg: plan.merge, slot: merge_slot, x: 1, y: 4, z: pad_u });
                     let n_elem = pad_u * HIDDEN as u32;
-                    let add_slot = push(bytemuck::bytes_of(&AddCfg {
-                        n: n_elem,
-                        mode: layer.add_mode,
-                        _p0: 0,
-                        _p1: 0,
-                    }))?;
-                    // The add kernel works four elements per lane.
-                    ops.push(Op {
-                        pipe: Pid::Add,
-                        bg: layer.add,
-                        slot: add_slot,
-                        x: (n_elem / 4).div_ceil(256),
-                        y: 1,
-                        z: 1,
-                    });
+                    if !fuse_add {
+                        let add_slot = push(bytemuck::bytes_of(&AddCfg {
+                            n: n_elem,
+                            mode: layer.add_mode,
+                            _p0: 0,
+                            _p1: 0,
+                        }))?;
+                        // The add kernel works four elements per lane.
+                        ops.push(Op {
+                            pipe: Pid::Add,
+                            bg: layer.add,
+                            slot: add_slot,
+                            x: (n_elem / 4).div_ceil(256),
+                            y: 1,
+                            z: 1,
+                        });
+                    }
                     push_gemm(
                         &mut push, &mut ops, Pid::GemmF32c, layer.outp, pad_u, HIDDEN as u32,
                         HIDDEN as u32, HIDDEN as u32, 0, 0, 0, HIDDEN as u32, 1,
@@ -1381,9 +1385,17 @@ fn build_plan(engine: &GpuEngine, acts: &Acts) -> Result<Plan> {
             3,
             &engine.uni,
         ));
+        // The fused memory pass writes the residual target directly and folds
+        // the add in (`SVS_FUSE_ADD=0` restores the separate `add` op, which
+        // reads `acts.fsmn` instead).
         let fsmn = push(bind(
             dev, &pipes.fsmn_l, "fsmn",
-            &[(0, Res::Whole(&acts.qkv)), (1, Res::Part(&layer.fsmn)), (3, Res::Whole(&acts.fsmn))],
+            &[
+                (0, Res::Whole(&acts.qkv)),
+                (1, Res::Part(&layer.fsmn)),
+                (3, Res::Whole(dst_buf)),
+                (4, Res::Whole(src_buf)),
+            ],
             2,
             &engine.uni,
         ));
@@ -1519,7 +1531,7 @@ impl Pipes {
         let ln_l = bgl(dev, "ln", &[ro(0), ro(1), ro(2), uni(3), rw(4)]);
         let gemm_l = bgl(dev, "gemm", &[ro(0), ro(1), rw(2), uni(3)]);
         let gemm_b_l = bgl(dev, "gemm-b", &[ro(0), ro(1), rw(2), uni(3), ro(4)]);
-        let fsmn_l = bgl(dev, "fsmn", &[ro(0), ro(1), uni(2), rw(3)]);
+        let fsmn_l = bgl(dev, "fsmn", &[ro(0), ro(1), uni(2), rw(3), ro(4)]);
         let split_l = bgl(dev, "split", &[ro(0), rw(1), rw(2), rw(3), uni(4)]);
         let soft_l = bgl(dev, "soft", &[rw(0), uni(1)]);
         let merge_l = bgl(dev, "merge", &[ro(0), rw(1), uni(2)]);

@@ -105,6 +105,13 @@ pub fn fuse_relu() -> bool {
     *F.get_or_init(|| std::env::var("SVS_FUSE_RELU").map_or(true, |v| v != "0"))
 }
 
+/// `SVS_FUSE_ADD=0` falls back to the separate residual `add` pass after the
+/// memory block (the fused form does the same `src + mem` in that kernel).
+pub fn fuse_add() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("SVS_FUSE_ADD").map_or(true, |v| v != "0"))
+}
+
 /// `SVS_CPU_PROF=1`: per-phase wall-clock accounting in the CPU encoder.
 pub fn cpu_prof() -> bool {
     env_eq1("SVS_CPU_PROF")
