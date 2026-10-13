@@ -70,28 +70,33 @@ fn layernorm(@builtin(workgroup_id) wid: vec3<u32>,
 pub fn split_qkv() -> String {
     "struct SplitCfg { t_pad: u32, t_valid: u32, scale: f32, _p: u32 };
 @group(0) @binding(0) var<storage, read> Qkv: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Q: array<f32>;
-@group(0) @binding(2) var<storage, read_write> K: array<f32>;
-@group(0) @binding(3) var<storage, read_write> V: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Q: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> K: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> V: array<vec4<f32>>;
 @group(0) @binding(4) var<uniform> cfg: SplitCfg;
 
 @compute @workgroup_size(128, 1, 1)
 fn split(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
+    let d4 = gid.x;
     let h = gid.y;
     let t = gid.z;
-    if (d >= 128u || h >= 4u || t >= cfg.t_pad) { return; }
-    let dst = (h * cfg.t_pad + t) * 128u + d;
+    if (d4 >= 32u || h >= 4u || t >= cfg.t_pad) { return; }
+    let dst = (h * cfg.t_pad + t) * 32u + d4;
     if (t >= cfg.t_valid) {
-        Q[dst] = 0.0;
-        K[dst] = 0.0;
-        V[dst] = 0.0;
+        Q[dst] = vec4<f32>(0.0);
+        K[dst] = vec4<f32>(0.0);
+        V[dst] = vec4<f32>(0.0);
         return;
     }
-    let src = t * 1536u + h * 128u + d;
-    Q[dst] = Qkv[src] * cfg.scale;
-    K[dst] = Qkv[src + 512u];
-    V[dst] = Qkv[src + 1024u];
+    let base = t * 1536u + h * 128u + d4 * 4u;
+    Q[dst] = vec4<f32>(
+        Qkv[base] * cfg.scale,
+        Qkv[base + 1u] * cfg.scale,
+        Qkv[base + 2u] * cfg.scale,
+        Qkv[base + 3u] * cfg.scale,
+    );
+    K[dst] = vec4<f32>(Qkv[base + 512u], Qkv[base + 513u], Qkv[base + 514u], Qkv[base + 515u]);
+    V[dst] = vec4<f32>(Qkv[base + 1024u], Qkv[base + 1025u], Qkv[base + 1026u], Qkv[base + 1027u]);
 }
 "
     .to_string()
@@ -99,21 +104,21 @@ fn split(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub fn merge_heads() -> String {
     "struct MergeCfg { t_pad: u32, t_valid: u32, _p0: u32, _p1: u32 };
-@group(0) @binding(0) var<storage, read> Av: array<f32>;
-@group(0) @binding(1) var<storage, read_write> Ctx: array<f32>;
+@group(0) @binding(0) var<storage, read> Av: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> Ctx: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> cfg: MergeCfg;
 
 @compute @workgroup_size(128, 1, 1)
 fn merge(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
+    let d4 = gid.x;
     let h = gid.y;
     let t = gid.z;
-    if (d >= 128u || h >= 4u || t >= cfg.t_pad) { return; }
-    var val = 0.0;
+    if (d4 >= 32u || h >= 4u || t >= cfg.t_pad) { return; }
+    var val = vec4<f32>(0.0);
     if (t < cfg.t_valid) {
-        val = Av[(h * cfg.t_pad + t) * 128u + d];
+        val = Av[(h * cfg.t_pad + t) * 32u + d4];
     }
-    Ctx[t * 512u + h * 128u + d] = val;
+    Ctx[t * 128u + h * 32u + d4] = val;
 }
 "
     .to_string()
@@ -254,15 +259,15 @@ fn softmax_cached(@builtin(workgroup_id) wid: vec3<u32>,
 
 pub fn add() -> String {
     "struct AddCfg { n: u32, mode: u32, _p0: u32, _p1: u32 };
-@group(0) @binding(0) var<storage, read> A: array<f32>;
-@group(0) @binding(1) var<storage, read> B: array<f32>;
-@group(0) @binding(2) var<storage, read_write> D: array<f32>;
+@group(0) @binding(0) var<storage, read> A: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> B: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> D: array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> cfg: AddCfg;
 
 @compute @workgroup_size(256)
 fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= cfg.n) { return; }
+    if (i * 4u >= cfg.n) { return; }
     var o = B[i];
     if (cfg.mode == 1u) {
         o = A[i] + B[i];
@@ -275,14 +280,14 @@ fn add(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 pub fn relu() -> String {
     "struct NCfg { n: u32, _a: u32, _b: u32, _c: u32 };
-@group(0) @binding(0) var<storage, read_write> X: array<f32>;
+@group(0) @binding(0) var<storage, read_write> X: array<vec4<f32>>;
 @group(0) @binding(1) var<uniform> cfg: NCfg;
 
 @compute @workgroup_size(256)
 fn relu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= cfg.n) { return; }
-    X[i] = max(X[i], 0.0);
+    if (i * 4u >= cfg.n) { return; }
+    X[i] = max(X[i], vec4<f32>(0.0));
 }
 "
     .to_string()

@@ -1112,11 +1112,12 @@ impl GpuEngine {
                         _p0: 0,
                         _p1: 0,
                     }))?;
+                    // The add kernel works four elements per lane.
                     ops.push(Op {
                         pipe: Pid::Add,
                         bg: layer.add,
                         slot: add_slot,
-                        x: n_elem.div_ceil(256),
+                        x: (n_elem / 4).div_ceil(256),
                         y: 1,
                         z: 1,
                     });
@@ -1136,11 +1137,12 @@ impl GpuEngine {
                         _b: 0,
                         _c: 0,
                     }))?;
+                    // The relu kernel works four elements per lane.
                     ops.push(Op {
                         pipe: Pid::Relu,
                         bg: plan.relu,
                         slot: relu_slot,
-                        x: (relu_n + 255) / 256,
+                        x: (relu_n / 4).div_ceil(256),
                         y: 1,
                         z: 1,
                     });
