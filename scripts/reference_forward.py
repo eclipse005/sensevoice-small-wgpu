@@ -37,7 +37,9 @@ EVENT_DICT = {
     "<|Cry|>": "😭",
     "<|Sneeze|>": "🤧",
     "<|Breath|>": "",
-    "<|Cough|>": "😷",
+    # Official FunASR `event_dict` really maps Cough to 🤧 (same as Sneeze);
+    # `emoji_dict` says 😷 but its values are never used by the renderer.
+    "<|Cough|>": "🤧",
 }
 LANG_DICT = {
     "<|zh|>": "<|lang|>",
